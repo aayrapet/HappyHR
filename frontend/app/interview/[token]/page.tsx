@@ -205,9 +205,16 @@ SAFETY/FAIRNESS RULES:
           systemInstruction: systemInstruction,
         },
         callbacks: {
+          // Trouve ceci :
           onopen: () => {
             console.log("Live session opened");
+
+            // ✨ AJOUTE CES 3 LIGNES ICI ✨
+            session.send({ // On envoie un premier message texte pour réveiller l'IA
+              parts: [{ text: "Hello! The interview is starting now. Please introduce yourself and ask the first question." }]
+            });
           },
+
           onmessage: (msg: any) => {
             // Handle audio output
             if (msg.serverContent?.modelTurn?.parts) {
@@ -309,7 +316,7 @@ SAFETY/FAIRNESS RULES:
         sessionRef.current.close();
         sessionRef.current = null;
       }
-    } catch {}
+    } catch { }
 
     // Stop mic
     if (streamRef.current) {
@@ -318,7 +325,7 @@ SAFETY/FAIRNESS RULES:
 
     // Close audio context
     if (audioContextRef.current) {
-      try { audioContextRef.current.close(); } catch {}
+      try { audioContextRef.current.close(); } catch { }
     }
 
     // Build transcript string
@@ -447,11 +454,10 @@ SAFETY/FAIRNESS RULES:
               className={`flex ${entry.role === "user" ? "justify-end" : "justify-start"}`}
             >
               <div
-                className={`max-w-[80%] rounded-2xl px-4 py-3 ${
-                  entry.role === "user"
-                    ? "bg-blue-600 text-white"
-                    : "bg-white border border-slate-200 text-slate-800"
-                }`}
+                className={`max-w-[80%] rounded-2xl px-4 py-3 ${entry.role === "user"
+                  ? "bg-blue-600 text-white"
+                  : "bg-white border border-slate-200 text-slate-800"
+                  }`}
               >
                 <p className="text-xs font-medium mb-1 opacity-70">
                   {entry.role === "user" ? "You" : "Sarah (AI)"}
