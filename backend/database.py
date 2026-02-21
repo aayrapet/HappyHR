@@ -37,7 +37,7 @@ async def init_db():
                     "Tell me about your experience with team collaboration and agile workflows.",
                     "Where do you see yourself in the next two years, and what are you looking to learn?"
                 ],
-                match_threshold=0.2,
+                match_threshold=0.01,
                 max_interview_minutes=8,
             )
             session.add(seed)

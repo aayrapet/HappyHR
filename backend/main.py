@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
@@ -7,8 +7,12 @@ from typing import Optional
 import secrets
 import os
 import json
+import asyncio
+import struct
+import base64
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
+import websockets
 
 load_dotenv()
 
@@ -378,3 +382,324 @@ async def get_job_config(db: AsyncSession = Depends(get_db)):
         "keywords": job.keywords,
         "mandatory_questions": job.mandatory_questions,
     }
+
+
+# ── WebSocket Interview Relay ──────────────────────────────
+
+def build_system_instruction(ctx: dict) -> str:
+    questions = "\n".join(f"{i+1}. {q}" for i, q in enumerate(ctx["mandatory_questions"]))
+    keywords = ", ".join(ctx["keywords"])
+    return f"""You are an experienced HR recruiter named Sarah conducting a short phone screen for the position of {ctx["job_title"]}.
+
+JOB DESCRIPTION:
+{ctx["job_description"]}
+
+MANDATORY QUESTIONS (you MUST ask all of these, in any order):
+{questions}
+
+KEYWORDS TO PROBE FOR:
+{keywords}
+
+CANDIDATE CONTEXT:
+Name: {ctx["candidate_name"]}
+CV Summary (truncated):
+{ctx["cv_text"]}
+
+CONVERSATION RULES:
+- Greet the candidate warmly by name and introduce yourself as Sarah from HappyHR.
+- Ask ONE question at a time.
+- Keep your responses concise and natural - this should feel like a real phone conversation.
+- Listen carefully and ask relevant follow-up questions when appropriate.
+- Probe for evidence of the listed keywords through natural conversation.
+- After all mandatory questions are covered, ask if the candidate has any questions about the role.
+- End the interview gracefully when: (a) all mandatory questions are done AND (b) the candidate has no more questions, OR after {ctx["max_interview_minutes"]} minutes.
+- When ending, thank the candidate and let them know they'll hear back soon.
+
+SAFETY/FAIRNESS RULES:
+- Do NOT infer or ask about protected attributes (race, religion, health, disability, age, gender, sexual orientation, marital status, etc.).
+- Evaluate ONLY job-relevant skills and experience.
+- Be equally warm and professional with all candidates."""
+
+
+def build_gemini_ws_url() -> str:
+    api_key = os.getenv("GEMINI_API_KEY")
+    return (
+        "wss://generativelanguage.googleapis.com/ws/"
+        "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        f"?key={api_key}"
+    )
+
+
+def pcm16_mono_to_wav(pcm_bytes: bytes, sample_rate: int = 16000) -> bytes:
+    """Wrap raw PCM16 mono bytes into a WAV container."""
+    channels = 1
+    bits_per_sample = 16
+    byte_rate = sample_rate * channels * (bits_per_sample // 8)
+    block_align = channels * (bits_per_sample // 8)
+    data_size = len(pcm_bytes)
+
+    header = struct.pack(
+        '<4sI4s4sIHHIIHH4sI',
+        b'RIFF', 36 + data_size, b'WAVE',
+        b'fmt ', 16, 1, channels,
+        sample_rate, byte_rate, block_align, bits_per_sample,
+        b'data', data_size
+    )
+    return header + pcm_bytes
+
+
+async def transcribe_audio_with_gemini(audio_chunks: list[str]) -> str:
+    """Transcribe candidate audio chunks using Gemini STT."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    stt_model = os.getenv("STT_MODEL", "gemini-2.5-flash")
+
+    if not audio_chunks:
+        return ""
+
+    # Concatenate base64 chunks into raw PCM buffer
+    pcm_parts = [base64.b64decode(chunk) for chunk in audio_chunks]
+    pcm_buffer = b"".join(pcm_parts)
+
+    if len(pcm_buffer) < 6000:  # Too short to be useful
+        return ""
+
+    wav_bytes = pcm16_mono_to_wav(pcm_buffer, 16000)
+    wav_b64 = base64.b64encode(wav_bytes).decode()
+
+    from google import genai
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=stt_model,
+        contents=[
+            {
+                "role": "user",
+                "parts": [
+                    {"text": "Transcribe this audio exactly. Output only the transcript text, no commentary."},
+                    {"inline_data": {"mime_type": "audio/wav", "data": wav_b64}},
+                ],
+            }
+        ],
+    )
+    return response.text.strip() if response.text else ""
+
+
+@app.websocket("/ws/{token}")
+async def websocket_interview(ws: WebSocket, token: str):
+    """WebSocket relay: Browser ↔ Backend ↔ Gemini Live API."""
+    # Get interview context from DB
+    async for db in get_db():
+        result = await db.execute(select(Candidate).where(Candidate.interview_token == token))
+        candidate = result.scalar_one_or_none()
+        if not candidate or candidate.status == "interview_completed":
+            await ws.close(code=4004, reason="Invalid or expired token")
+            return
+
+        job_result = await db.execute(select(JobConfig).where(JobConfig.id == candidate.job_config_id))
+        job = job_result.scalar_one_or_none()
+        break
+
+    ctx = {
+        "candidate_name": f"{candidate.first_name} {candidate.last_name}",
+        "job_title": job.title,
+        "job_description": job.description,
+        "keywords": job.keywords,
+        "mandatory_questions": job.mandatory_questions,
+        "cv_text": candidate.cv_text[:3000],
+        "max_interview_minutes": job.max_interview_minutes,
+    }
+
+    await ws.accept()
+
+    gemini_model = os.getenv("LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
+    gemini_url = build_gemini_ws_url()
+
+    # Track transcript for scoring
+    model_text_buffer = ""
+    transcript_parts = []  # list of {"role": "ai"|"user", "text": str, "index": int}
+    candidate_audio_chunks = []  # current speech segment
+    all_candidate_audio = []  # list of {"index": int, "chunks": list[str]}
+    turn_index = 0
+
+    try:
+        async with websockets.connect(gemini_url) as gemini_ws:
+            # Send setup message
+            setup_msg = {
+                "setup": {
+                    "model": f"models/{gemini_model}" if not gemini_model.startswith("models/") else gemini_model,
+                    "generationConfig": {
+                        "responseModalities": ["AUDIO"],
+                    },
+                    "systemInstruction": {
+                        "parts": [{"text": build_system_instruction(ctx)}]
+                    },
+                }
+            }
+            await gemini_ws.send(json.dumps(setup_msg))
+
+            # Wait for setupComplete (loop in case other messages arrive first)
+            while True:
+                setup_response = await gemini_ws.recv()
+                setup_data = json.loads(setup_response)
+                print(f"[WS] Gemini setup response: {list(setup_data.keys())}")
+                if setup_data.get("setupComplete") is not None:
+                    break
+
+            await ws.send_json({"type": "status", "message": "Connected to Gemini Live API"})
+            print("[WS] Setup complete, sending initial trigger to Gemini")
+
+            # Send initial trigger so Gemini starts the interview
+            await gemini_ws.send(json.dumps({
+                "clientContent": {
+                    "turns": [{"role": "user", "parts": [{"text": "Hello, I'm ready to start the interview."}]}],
+                    "turnComplete": True,
+                }
+            }))
+
+            async def gemini_to_client():
+                """Forward Gemini messages to the browser client."""
+                nonlocal model_text_buffer, turn_index
+                try:
+                    async for raw in gemini_ws:
+                        msg = json.loads(raw)
+                        print(f"[WS] Gemini → client: keys={list(msg.keys())}")
+
+                        parts = msg.get("serverContent", {}).get("modelTurn", {}).get("parts", [])
+                        for part in parts:
+                            inline = part.get("inlineData")
+                            if inline and inline.get("data") and inline.get("mimeType", "").startswith("audio/pcm"):
+                                print(f"[WS] Sending audio chunk to client ({len(inline['data'])} b64 bytes)")
+                                await ws.send_json({
+                                    "type": "audio",
+                                    "mimeType": inline["mimeType"],
+                                    "data": inline["data"],
+                                })
+
+                            text = part.get("text")
+                            if text:
+                                model_text_buffer += (" " if model_text_buffer else "") + text
+                                await ws.send_json({"type": "text", "text": text})
+
+                        if msg.get("serverContent", {}).get("turnComplete"):
+                            if model_text_buffer.strip():
+                                transcript_parts.append({"role": "ai", "text": model_text_buffer.strip(), "index": turn_index})
+                                turn_index += 1
+                                model_text_buffer = ""
+                            await ws.send_json({"type": "turnComplete"})
+
+                        if msg.get("error"):
+                            await ws.send_json({"type": "error", "error": msg["error"]})
+
+                except websockets.ConnectionClosed as e:
+                    print(f"[WS] Gemini connection closed: {e}")
+                except Exception as e:
+                    print(f"[WS] gemini_to_client error: {e}")
+
+            async def client_to_gemini():
+                """Forward browser client messages to Gemini."""
+                nonlocal candidate_audio_chunks, turn_index
+                try:
+                    while True:
+                        data = await ws.receive_text()
+                        msg = json.loads(data)
+
+                        if msg.get("type") == "audio" and msg.get("data"):
+                            # Store audio for STT
+                            candidate_audio_chunks.append(msg["data"])
+                            # Forward to Gemini
+                            await gemini_ws.send(json.dumps({
+                                "realtimeInput": {
+                                    "mediaChunks": [{
+                                        "mimeType": msg.get("mimeType", "audio/pcm;rate=16000"),
+                                        "data": msg["data"],
+                                    }]
+                                }
+                            }))
+
+                        elif msg.get("type") == "speechStart":
+                            candidate_audio_chunks = []
+
+                        elif msg.get("type") == "speechEnd":
+                            if candidate_audio_chunks:
+                                idx = turn_index
+                                turn_index += 1
+                                all_candidate_audio.append({"index": idx, "chunks": list(candidate_audio_chunks)})
+                                # Add placeholder in transcript
+                                transcript_parts.append({"role": "user", "text": "", "index": idx})
+                            candidate_audio_chunks = []
+
+                        elif msg.get("type") == "text" and msg.get("text"):
+                            transcript_parts.append({"role": "user", "text": msg["text"], "index": turn_index})
+                            turn_index += 1
+                            await gemini_ws.send(json.dumps({
+                                "clientContent": {
+                                    "turns": [{"role": "user", "parts": [{"text": msg["text"]}]}],
+                                    "turnComplete": True,
+                                }
+                            }))
+
+                except WebSocketDisconnect:
+                    print("[WS] Client disconnected")
+                except Exception as e:
+                    print(f"[WS] client_to_gemini error: {e}")
+
+            # Run both relay tasks concurrently
+            await asyncio.gather(
+                gemini_to_client(),
+                client_to_gemini(),
+                return_exceptions=True,
+            )
+
+    except Exception as e:
+        import traceback
+        print(f"[WS] WebSocket interview error: {e}")
+        traceback.print_exc()
+        try:
+            await ws.send_json({"type": "error", "error": str(e)})
+        except Exception:
+            pass
+
+    # Post-interview: transcribe candidate audio and fill in transcript placeholders
+    try:
+        for audio_entry in all_candidate_audio:
+            try:
+                stt_text = await transcribe_audio_with_gemini(audio_entry["chunks"])
+                if stt_text:
+                    # Find and update the placeholder entry
+                    for part in transcript_parts:
+                        if part.get("index") == audio_entry["index"] and part["role"] == "user":
+                            part["text"] = stt_text
+                            break
+            except Exception as e:
+                print(f"STT error: {e}")
+
+        # Sort by index and build transcript string
+        transcript_parts.sort(key=lambda p: p.get("index", 0))
+        transcript_text = "\n\n".join(
+            f"{'Interviewer' if p['role'] == 'ai' else 'Candidate'}: {p['text']}"
+            for p in transcript_parts
+            if p.get("text")
+        )
+
+        if transcript_text.strip():
+            async for db in get_db():
+                scoring = await score_interview(transcript_text, job, candidate)
+                interview_result = InterviewResult(
+                    candidate_id=candidate.id,
+                    transcript=transcript_text,
+                    summary=scoring.get("summary"),
+                    questions=scoring.get("questions"),
+                    keyword_coverage=scoring.get("keyword_coverage"),
+                    global_score=scoring.get("global_score"),
+                    recommendation=scoring.get("recommendation"),
+                    red_flags=scoring.get("red_flags"),
+                    raw_scoring_json=scoring,
+                )
+                db.add(interview_result)
+                candidate.status = "interview_completed"
+                candidate.global_score = scoring.get("global_score")
+                candidate.recommendation = scoring.get("recommendation")
+                await db.commit()
+                break
+
+    except Exception as e:
+        print(f"Post-interview processing error: {e}")

@@ -7,3 +7,4 @@ PyMuPDF==1.25.1
 google-genai==1.5.0
 python-dotenv==1.0.1
 aiosqlite==0.20.0
+websockets>=12.0

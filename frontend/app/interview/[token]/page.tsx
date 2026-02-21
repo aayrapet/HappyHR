@@ -2,10 +2,8 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams } from "next/navigation";
-import { GoogleGenAI, Modality } from "@google/genai";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const LIVE_MODEL = process.env.NEXT_PUBLIC_LIVE_MODEL || "gemini-2.5-flash-native-audio-preview-12-2025";
 
 interface TranscriptEntry {
   role: "user" | "ai";
@@ -23,30 +21,70 @@ interface InterviewContext {
   max_interview_minutes: number;
 }
 
-// AudioWorklet processor code as a blob URL
-const WORKLET_CODE = `
-class PCMProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this._buffer = new Float32Array(0);
+// ── Audio helpers (from vocal-part) ──────────────────────
+
+function int16ToFloat32(int16: Int16Array): Float32Array {
+  const f32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    f32[i] = int16[i] / 32768;
   }
-  process(inputs) {
-    const input = inputs[0];
-    if (input.length > 0) {
-      const channelData = input[0];
-      // Convert float32 to int16 PCM
-      const int16 = new Int16Array(channelData.length);
-      for (let i = 0; i < channelData.length; i++) {
-        const s = Math.max(-1, Math.min(1, channelData[i]));
-        int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-      }
-      this.port.postMessage(int16.buffer, [int16.buffer]);
-    }
-    return true;
-  }
+  return f32;
 }
-registerProcessor('pcm-processor', PCMProcessor);
-`;
+
+function base64ToInt16(base64: string): Int16Array {
+  const binary = atob(base64);
+  const len = binary.length;
+  const buffer = new ArrayBuffer(len);
+  const bytes = new Uint8Array(buffer);
+  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+  return new Int16Array(buffer);
+}
+
+function floatTo16BitPCM(float32Array: Float32Array): Uint8Array {
+  const buffer = new ArrayBuffer(float32Array.length * 2);
+  const view = new DataView(buffer);
+  for (let i = 0; i < float32Array.length; i++) {
+    let s = Math.max(-1, Math.min(1, float32Array[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Uint8Array(buffer);
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function downsampleTo16k(float32Buffer: Float32Array, inputSampleRate: number): Float32Array {
+  if (inputSampleRate === 16000) return float32Buffer;
+  const ratio = inputSampleRate / 16000;
+  const newLength = Math.round(float32Buffer.length / ratio);
+  const result = new Float32Array(newLength);
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < float32Buffer.length; i++) {
+      accum += float32Buffer[i];
+      count++;
+    }
+    result[offsetResult] = count > 0 ? accum / count : 0;
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+
+  return result;
+}
+
+// ──────────────────────────────────────────────────────────
 
 export default function InterviewPage() {
   const params = useParams();
@@ -57,16 +95,25 @@ export default function InterviewPage() {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [error, setError] = useState("");
   const [elapsed, setElapsed] = useState(0);
+  const [isSpeaking, setIsSpeaking] = useState(false);
 
-  const sessionRef = useRef<any>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
-  const playbackQueueRef = useRef<Int16Array[]>([]);
-  const isPlayingRef = useRef(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const playbackTimeRef = useRef(0);
+  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeRef = useRef<number>(0);
+  const speakingRef = useRef(false);
+  const transcriptRef = useRef<TranscriptEntry[]>([]);
+
+  // Keep transcriptRef in sync
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
 
   // Scroll transcript to bottom
   useEffect(() => {
@@ -92,78 +139,47 @@ export default function InterviewPage() {
     })();
   }, [token]);
 
-  // Audio playback (24kHz PCM)
-  const playAudioChunk = useCallback((pcmData: Int16Array) => {
-    if (!audioContextRef.current) return;
-    playbackQueueRef.current.push(pcmData);
-    if (!isPlayingRef.current) {
-      drainPlaybackQueue();
+  // ── Playback controls (from vocal-part) ──
+
+  const stopPlaybackNow = useCallback(() => {
+    for (const src of activeSourcesRef.current) {
+      try { src.stop(0); } catch { /* ignore */ }
+    }
+    activeSourcesRef.current.clear();
+    if (audioCtxRef.current) {
+      playbackTimeRef.current = audioCtxRef.current.currentTime;
     }
   }, []);
 
-  const drainPlaybackQueue = useCallback(() => {
-    if (!audioContextRef.current || playbackQueueRef.current.length === 0) {
-      isPlayingRef.current = false;
-      return;
-    }
-    isPlayingRef.current = true;
-    const pcm = playbackQueueRef.current.shift()!;
+  const playPcmBase64 = useCallback((base64: string, mimeType: string = "audio/pcm;rate=24000") => {
+    const audioCtx = audioCtxRef.current;
+    if (!audioCtx) return;
 
-    const float32 = new Float32Array(pcm.length);
-    for (let i = 0; i < pcm.length; i++) {
-      float32[i] = pcm[i] / 32768;
-    }
+    const sampleRateMatch = /rate=(\d+)/.exec(mimeType);
+    const sampleRate = sampleRateMatch ? Number(sampleRateMatch[1]) : 24000;
 
-    const buffer = audioContextRef.current.createBuffer(1, float32.length, 24000);
-    buffer.getChannelData(0).set(float32);
+    const pcm16 = base64ToInt16(base64);
+    const audioData = int16ToFloat32(pcm16);
 
-    const source = audioContextRef.current.createBufferSource();
+    const buffer = audioCtx.createBuffer(1, audioData.length, sampleRate);
+    buffer.copyToChannel(new Float32Array(audioData.buffer as ArrayBuffer), 0);
+
+    const source = audioCtx.createBufferSource();
     source.buffer = buffer;
-    source.connect(audioContextRef.current.destination);
-    source.onended = () => drainPlaybackQueue();
-    source.start();
+    source.connect(audioCtx.destination);
+
+    if (playbackTimeRef.current < audioCtx.currentTime) {
+      playbackTimeRef.current = audioCtx.currentTime;
+    }
+    source.start(playbackTimeRef.current);
+    playbackTimeRef.current += buffer.duration;
+
+    activeSourcesRef.current.add(source);
+    source.onended = () => activeSourcesRef.current.delete(source);
   }, []);
 
-  const clearPlayback = useCallback(() => {
-    playbackQueueRef.current = [];
-    isPlayingRef.current = false;
-  }, []);
+  // ── Start interview ──
 
-  // Build system instruction
-  const buildSystemInstruction = (ctx: InterviewContext) => {
-    return `You are an experienced HR recruiter named Sarah conducting a short phone screen for the position of ${ctx.job_title}.
-
-JOB DESCRIPTION:
-${ctx.job_description}
-
-MANDATORY QUESTIONS (you MUST ask all of these, in any order):
-${ctx.mandatory_questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}
-
-KEYWORDS TO PROBE FOR:
-${ctx.keywords.join(", ")}
-
-CANDIDATE CONTEXT:
-Name: ${ctx.candidate_name}
-CV Summary (truncated):
-${ctx.cv_text}
-
-CONVERSATION RULES:
-- Greet the candidate warmly by name and introduce yourself as Sarah from HappyHR.
-- Ask ONE question at a time.
-- Keep your responses concise and natural - this should feel like a real phone conversation.
-- Listen carefully and ask relevant follow-up questions when appropriate.
-- Probe for evidence of the listed keywords through natural conversation.
-- After all mandatory questions are covered, ask if the candidate has any questions about the role.
-- End the interview gracefully when: (a) all mandatory questions are done AND (b) the candidate has no more questions, OR after ${ctx.max_interview_minutes} minutes.
-- When ending, thank the candidate and let them know they'll hear back soon.
-
-SAFETY/FAIRNESS RULES:
-- Do NOT infer or ask about protected attributes (race, religion, health, disability, age, gender, sexual orientation, marital status, etc.).
-- Evaluate ONLY job-relevant skills and experience.
-- Be equally warm and professional with all candidates.`;
-  };
-
-  // Start interview
   const startInterview = async () => {
     if (!context) return;
     setPhase("live");
@@ -173,130 +189,124 @@ SAFETY/FAIRNESS RULES:
     }, 1000);
 
     try {
-      // Get ephemeral token
-      const tokenRes = await fetch(`${API}/api/live-token`, { method: "POST" });
-      const tokenData = await tokenRes.json();
-      const apiKey = tokenData.token;
+      // Build WebSocket URL to backend
+      const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const apiHost = new URL(API).host;
+      const wsUrl = `${wsProtocol}//${apiHost}/ws/${token}`;
 
-      // Set up audio context
-      audioContextRef.current = new AudioContext({ sampleRate: 24000 });
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
-      // Get mic stream
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 16000,
-        },
-      });
-      streamRef.current = stream;
+      ws.onopen = () => {
+        console.log("WebSocket connected to backend");
+      };
 
-      // Connect to Gemini Live
-      const ai = new GoogleGenAI({ apiKey });
-      const systemInstruction = buildSystemInstruction(context);
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
 
-      const session = await ai.live.connect({
-        model: LIVE_MODEL,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          systemInstruction: systemInstruction,
-        },
-        callbacks: {
-          // Trouve ceci :
-          onopen: () => {
-            console.log("Live session opened");
+        if (msg.type === "status") {
+          console.log("Status:", msg.message);
+          return;
+        }
 
-            // ✨ AJOUTE CES 3 LIGNES ICI ✨
-            session.send({ // On envoie un premier message texte pour réveiller l'IA
-              parts: [{ text: "Hello! The interview is starting now. Please introduce yourself and ask the first question." }]
-            });
-          },
+        if (msg.type === "session") {
+          console.log("Session ID:", msg.sessionId);
+          return;
+        }
 
-          onmessage: (msg: any) => {
-            // Handle audio output
-            if (msg.serverContent?.modelTurn?.parts) {
-              for (const part of msg.serverContent.modelTurn.parts) {
-                if (part.inlineData?.mimeType?.startsWith("audio/pcm")) {
-                  const raw = atob(part.inlineData.data);
-                  const bytes = new Uint8Array(raw.length);
-                  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-                  const int16 = new Int16Array(bytes.buffer);
-                  playAudioChunk(int16);
-                }
-              }
+        if (msg.type === "text") {
+          // AI transcript text
+          setTranscript(prev => {
+            const last = prev[prev.length - 1];
+            if (last && last.role === "ai") {
+              return [...prev.slice(0, -1), { ...last, text: last.text + " " + msg.text }];
             }
-
-            // Handle interruption
-            if (msg.serverContent?.interrupted) {
-              clearPlayback();
-            }
-
-            // Handle input transcription
-            if (msg.serverContent?.inputTranscription?.text) {
-              const text = msg.serverContent.inputTranscription.text;
-              setTranscript(prev => {
-                const last = prev[prev.length - 1];
-                if (last && last.role === "user") {
-                  return [...prev.slice(0, -1), { ...last, text: last.text + text }];
-                }
-                return [...prev, { role: "user", text, timestamp: Date.now() }];
-              });
-            }
-
-            // Handle output transcription
-            if (msg.serverContent?.outputTranscription?.text) {
-              const text = msg.serverContent.outputTranscription.text;
-              setTranscript(prev => {
-                const last = prev[prev.length - 1];
-                if (last && last.role === "ai") {
-                  return [...prev.slice(0, -1), { ...last, text: last.text + text }];
-                }
-                return [...prev, { role: "ai", text, timestamp: Date.now() }];
-              });
-            }
-
-            // Handle turn complete - start new entry for next speaker
-            if (msg.serverContent?.turnComplete) {
-              // Turn is done, next text will create a new entry
-            }
-          },
-          onerror: (err: any) => {
-            console.error("Live session error:", err);
-          },
-          onclose: () => {
-            console.log("Live session closed");
-          },
-        },
-      });
-
-      sessionRef.current = session;
-
-      // Set up audio worklet for mic capture
-      const workletBlob = new Blob([WORKLET_CODE], { type: "application/javascript" });
-      const workletUrl = URL.createObjectURL(workletBlob);
-      const micContext = new AudioContext({ sampleRate: 16000 });
-      await micContext.audioWorklet.addModule(workletUrl);
-      URL.revokeObjectURL(workletUrl);
-
-      const source = micContext.createMediaStreamSource(stream);
-      const workletNode = new AudioWorkletNode(micContext, "pcm-processor");
-      workletNodeRef.current = workletNode;
-
-      workletNode.port.onmessage = (event) => {
-        if (sessionRef.current) {
-          const b64 = arrayBufferToBase64(event.data);
-          sessionRef.current.sendRealtimeInput({
-            data: b64,
-            mimeType: "audio/pcm;rate=16000",
+            return [...prev, { role: "ai", text: msg.text, timestamp: Date.now() }];
           });
+          return;
+        }
+
+        if (msg.type === "audio") {
+          playPcmBase64(msg.data, msg.mimeType);
+          return;
+        }
+
+        if (msg.type === "turnComplete") {
+          // Force new transcript entry for next speaker
+          setTranscript(prev => [...prev]);
+          return;
+        }
+
+        if (msg.type === "error") {
+          console.error("Server error:", msg.error);
         }
       };
 
-      source.connect(workletNode);
-      workletNode.connect(micContext.destination); // needed for worklet to process
+      ws.onclose = () => {
+        console.log("WebSocket closed");
+      };
+
+      ws.onerror = () => {
+        console.error("WebSocket error");
+      };
+
+      // Set up audio context
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioCtxRef.current = audioCtx;
+      playbackTimeRef.current = audioCtx.currentTime;
+
+      // Get microphone
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          channelCount: 1,
+        },
+      });
+      micStreamRef.current = micStream;
+
+      // Set up ScriptProcessor with speech detection (from vocal-part)
+      const micSource = audioCtx.createMediaStreamSource(micStream);
+      micSourceRef.current = micSource;
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (event: AudioProcessingEvent) => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+
+        const input = event.inputBuffer.getChannelData(0);
+
+        // RMS-based speech detection
+        let rms = 0;
+        for (let i = 0; i < input.length; i++) rms += input[i] * input[i];
+        rms = Math.sqrt(rms / input.length);
+
+        const speaking = rms > 0.02;
+        if (speaking && !speakingRef.current) {
+          speakingRef.current = true;
+          setIsSpeaking(true);
+          stopPlaybackNow(); // Interrupt AI audio when user speaks
+          wsRef.current.send(JSON.stringify({ type: "speechStart" }));
+        } else if (!speaking && speakingRef.current) {
+          speakingRef.current = false;
+          setIsSpeaking(false);
+          wsRef.current.send(JSON.stringify({ type: "speechEnd" }));
+        }
+
+        // Downsample and send audio
+        const downsampled = downsampleTo16k(input, audioCtx.sampleRate);
+        const pcmBytes = floatTo16BitPCM(downsampled);
+        const b64 = bytesToBase64(pcmBytes);
+
+        wsRef.current.send(JSON.stringify({
+          type: "audio",
+          mimeType: "audio/pcm;rate=16000",
+          data: b64,
+        }));
+      };
+
+      micSource.connect(processor);
+      processor.connect(audioCtx.destination);
 
     } catch (err: unknown) {
       console.error("Start interview error:", err);
@@ -305,50 +315,41 @@ SAFETY/FAIRNESS RULES:
     }
   };
 
-  // End interview
+  // ── End interview ──
+
   const endInterview = async () => {
     setPhase("ending");
     if (timerRef.current) clearInterval(timerRef.current);
 
-    // Close live session
-    try {
-      if (sessionRef.current) {
-        sessionRef.current.close();
-        sessionRef.current = null;
-      }
-    } catch { }
+    // Stop playback
+    stopPlaybackNow();
 
-    // Stop mic
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
+    // Stop audio processing
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current.onaudioprocess = null;
+      processorRef.current = null;
+    }
+    if (micSourceRef.current) {
+      micSourceRef.current.disconnect();
+      micSourceRef.current = null;
+    }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(t => t.stop());
+      micStreamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      try { audioCtxRef.current.close(); } catch { /* ignore */ }
+      audioCtxRef.current = null;
     }
 
-    // Close audio context
-    if (audioContextRef.current) {
-      try { audioContextRef.current.close(); } catch { }
+    // Close WebSocket (this triggers server-side scoring)
+    if (wsRef.current && wsRef.current.readyState <= WebSocket.OPEN) {
+      wsRef.current.close();
     }
+    wsRef.current = null;
 
-    // Build transcript string
-    const transcriptText = transcript
-      .map(e => `${e.role === "user" ? "Candidate" : "Interviewer"}: ${e.text}`)
-      .join("\n\n");
-
-    // Send for scoring
-    try {
-      const res = await fetch(`${API}/api/interview-complete/${token}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript: transcriptText }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setPhase("done");
-      } else {
-        setPhase("done");
-      }
-    } catch {
-      setPhase("done");
-    }
+    setPhase("done");
   };
 
   const formatTime = (seconds: number) => {
@@ -405,7 +406,8 @@ SAFETY/FAIRNESS RULES:
             <ul className="list-disc list-inside space-y-1">
               <li>Find a quiet environment</li>
               <li>Allow microphone access when prompted</li>
-              <li>Speak naturally - no push-to-talk needed</li>
+              <li>Speak naturally - the AI will detect when you start and stop talking</li>
+              <li>You can interrupt the interviewer by speaking</li>
               <li>The interview takes about {context?.max_interview_minutes} minutes</li>
             </ul>
           </div>
@@ -427,8 +429,10 @@ SAFETY/FAIRNESS RULES:
       {/* Top bar */}
       <div className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
-          <span className="font-semibold text-slate-900">Interview in Progress</span>
+          <div className={`w-3 h-3 rounded-full ${isSpeaking ? "bg-green-500 animate-pulse" : "bg-red-500 animate-pulse"}`} />
+          <span className="font-semibold text-slate-900">
+            {isSpeaking ? "You are speaking..." : "Interview in Progress"}
+          </span>
           <span className="text-slate-500 text-sm">{formatTime(elapsed)}</span>
         </div>
         <button
@@ -454,10 +458,11 @@ SAFETY/FAIRNESS RULES:
               className={`flex ${entry.role === "user" ? "justify-end" : "justify-start"}`}
             >
               <div
-                className={`max-w-[80%] rounded-2xl px-4 py-3 ${entry.role === "user"
-                  ? "bg-blue-600 text-white"
-                  : "bg-white border border-slate-200 text-slate-800"
-                  }`}
+                className={`max-w-[80%] rounded-2xl px-4 py-3 ${
+                  entry.role === "user"
+                    ? "bg-blue-600 text-white"
+                    : "bg-white border border-slate-200 text-slate-800"
+                }`}
               >
                 <p className="text-xs font-medium mb-1 opacity-70">
                   {entry.role === "user" ? "You" : "Sarah (AI)"}
@@ -471,13 +476,4 @@ SAFETY/FAIRNESS RULES:
       </div>
     </div>
   );
-}
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
 }

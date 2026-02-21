@@ -5,23 +5,34 @@ import os
 
 
 def send_email(to_email: str, subject: str, html_body: str):
-    gmail_user = os.getenv("GMAIL_USER")
-    gmail_password = os.getenv("GMAIL_APP_PASSWORD")
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "465"))
+    smtp_user = os.getenv("SMTP_USER", os.getenv("GMAIL_USER"))
+    smtp_password = os.getenv("SMTP_PASSWORD", os.getenv("GMAIL_APP_PASSWORD"))
 
-    if not gmail_user or not gmail_password:
+    if not smtp_user or not smtp_password:
         print(f"[EMAIL STUB] To: {to_email} | Subject: {subject}")
         print(f"[EMAIL STUB] Body: {html_body[:200]}...")
         return
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = gmail_user
+    msg["From"] = smtp_user
     msg["To"] = to_email
     msg.attach(MIMEText(html_body, "html"))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(gmail_user, gmail_password)
-        server.sendmail(gmail_user, to_email, msg.as_string())
+    try:
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+                server.login(smtp_user, smtp_password)
+                server.sendmail(smtp_user, to_email, msg.as_string())
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls()
+                server.login(smtp_user, smtp_password)
+                server.sendmail(smtp_user, to_email, msg.as_string())
+    except Exception as e:
+        print(f"[EMAIL ERROR] Failed to send email to {to_email}: {e}")
 
 
 def send_interview_invite(to_email: str, name: str, token: str, job_title: str):
