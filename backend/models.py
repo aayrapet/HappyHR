@@ -17,6 +17,7 @@ class JobConfig(Base):
     mandatory_questions = Column(JSON, nullable=False)  # list of strings
     match_threshold = Column(Float, default=0.3)
     max_interview_minutes = Column(Integer, default=8)
+    is_active = Column(Integer, default=0)  # 0 or 1, SQLite-friendly boolean
     created_at = Column(DateTime, default=func.now())
 
 
@@ -42,7 +43,7 @@ class InterviewResult(Base):
     __tablename__ = "interview_results"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    candidate_id = Column(Integer, nullable=False)
+    candidate_id = Column(Integer, nullable=False, unique=True)
     transcript = Column(Text, nullable=False)
     summary = Column(Text, nullable=True)
     questions = Column(JSON, nullable=True)  # list of question objects

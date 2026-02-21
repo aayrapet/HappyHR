@@ -1,5 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from models import Base, JobConfig
+from sqlalchemy import select, text
 import os
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./happyhr.db")
@@ -11,9 +12,69 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Migrate: add is_active column for existing databases
+        try:
+            await conn.execute(text("ALTER TABLE job_configs ADD COLUMN is_active INTEGER DEFAULT 0"))
+        except Exception:
+            pass  # column already exists
+        # Ensure at least one config is active
+        await conn.execute(text(
+            """
+            UPDATE job_configs SET is_active = 1
+            WHERE id = (SELECT MIN(id) FROM job_configs)
+              AND NOT EXISTS (SELECT 1 FROM job_configs WHERE is_active = 1)
+            """
+        ))
+        # Keep one interview result per candidate before enforcing uniqueness.
+        await conn.execute(text(
+            """
+            DELETE FROM interview_results
+            WHERE id NOT IN (
+                SELECT MAX(id)
+                FROM interview_results
+                GROUP BY candidate_id
+            )
+            """
+        ))
+        # Backfill candidates that already have interview results but were never marked completed.
+        await conn.execute(text(
+            """
+            UPDATE candidates
+            SET
+                status = 'interview_completed',
+                global_score = COALESCE(
+                    (
+                        SELECT ir.global_score
+                        FROM interview_results ir
+                        WHERE ir.candidate_id = candidates.id
+                        ORDER BY ir.id DESC
+                        LIMIT 1
+                    ),
+                    global_score
+                ),
+                recommendation = COALESCE(
+                    (
+                        SELECT ir.recommendation
+                        FROM interview_results ir
+                        WHERE ir.candidate_id = candidates.id
+                        ORDER BY ir.id DESC
+                        LIMIT 1
+                    ),
+                    recommendation
+                )
+            WHERE status = 'invited'
+              AND EXISTS (
+                  SELECT 1
+                  FROM interview_results ir
+                  WHERE ir.candidate_id = candidates.id
+              )
+            """
+        ))
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_interview_results_candidate_id ON interview_results(candidate_id)"
+        ))
 
     async with async_session() as session:
-        from sqlalchemy import select
         result = await session.execute(select(JobConfig).limit(1))
         if result.scalar_one_or_none() is None:
             seed = JobConfig(
@@ -31,14 +92,15 @@ async def init_db():
                     "database", "testing", "devops"
                 ],
                 mandatory_questions=[
-                    "Tell me about yourself and your background in software development.",
-                    "Describe a challenging project you worked on recently. What was your role and what technologies did you use?",
-                    "How do you approach debugging a complex issue in production?",
-                    "Tell me about your experience with team collaboration and agile workflows.",
-                    "Where do you see yourself in the next two years, and what are you looking to learn?"
+                    {"question": "Tell me about yourself and your background in software development.", "expected_themes": []},
+                    {"question": "Describe a challenging project you worked on recently. What was your role and what technologies did you use?", "expected_themes": []},
+                    {"question": "How do you approach debugging a complex issue in production?", "expected_themes": []},
+                    {"question": "Tell me about your experience with team collaboration and agile workflows.", "expected_themes": []},
+                    {"question": "Where do you see yourself in the next two years, and what are you looking to learn?", "expected_themes": []},
                 ],
                 match_threshold=0.01,
                 max_interview_minutes=8,
+                is_active=1,
             )
             session.add(seed)
             await session.commit()

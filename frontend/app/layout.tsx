@@ -30,7 +30,7 @@ export default function RootLayout({
         <nav className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
           <a href="/" className="text-xl font-bold text-blue-600">HappyHR</a>
           <div className="flex gap-6 text-sm font-medium text-slate-600">
-            <a href="/apply" className="hover:text-blue-600 transition-colors">Apply</a>
+            <a href="/jobs" className="hover:text-blue-600 transition-colors">Job Posts</a>
             <a href="/dashboard" className="hover:text-blue-600 transition-colors">Dashboard</a>
           </div>
         </nav>

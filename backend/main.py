@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from pydantic import BaseModel
 from typing import Optional
 import secrets
@@ -60,6 +60,7 @@ async def apply(
     first_name: str = Form(...),
     last_name: str = Form(...),
     email: str = Form(...),
+    job_id: int = Form(...),
     cv: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
@@ -69,11 +70,11 @@ async def apply(
     if not cv_text.strip():
         raise HTTPException(400, "Could not extract text from PDF")
 
-    # Get job config
-    result = await db.execute(select(JobConfig).limit(1))
+    # Get specific job config
+    result = await db.execute(select(JobConfig).where(JobConfig.id == job_id, JobConfig.is_active == 1))
     job = result.scalar_one_or_none()
     if not job:
-        raise HTTPException(500, "No job configuration found")
+        raise HTTPException(404, "Job configuration not found or inactive")
 
     match_pct = keyword_match(cv_text, job.keywords)
     passed = match_pct >= job.match_threshold
@@ -119,12 +120,13 @@ async def interview_context(token: str, db: AsyncSession = Depends(get_db)):
     job_result = await db.execute(select(JobConfig).where(JobConfig.id == candidate.job_config_id))
     job = job_result.scalar_one_or_none()
 
+    mq_for_client = [_extract_question_text(q) for q in job.mandatory_questions]
     return {
         "candidate_name": f"{candidate.first_name} {candidate.last_name}",
         "job_title": job.title,
         "job_description": job.description,
         "keywords": job.keywords,
-        "mandatory_questions": job.mandatory_questions,
+        "mandatory_questions": mq_for_client,
         "cv_text": candidate.cv_text[:3000],
         "max_interview_minutes": job.max_interview_minutes,
     }
@@ -167,6 +169,48 @@ class InterviewCompleteRequest(BaseModel):
     transcript: str
 
 
+async def get_interview_result_for_candidate(
+    db: AsyncSession, candidate_id: int
+) -> Optional[InterviewResult]:
+    result = await db.execute(
+        select(InterviewResult)
+        .where(InterviewResult.candidate_id == candidate_id)
+        .order_by(InterviewResult.created_at.desc(), InterviewResult.id.desc())
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+def apply_scoring_to_candidate(candidate: Candidate, scoring: dict) -> None:
+    candidate.status = "interview_completed"
+    candidate.global_score = scoring.get("global_score")
+    candidate.recommendation = scoring.get("recommendation")
+
+
+def apply_scoring_to_interview(
+    interview_result: InterviewResult, transcript: str, scoring: dict
+) -> None:
+    interview_result.transcript = transcript
+    interview_result.summary = scoring.get("summary")
+    interview_result.questions = scoring.get("questions")
+    interview_result.keyword_coverage = scoring.get("keyword_coverage")
+    interview_result.global_score = scoring.get("global_score")
+    interview_result.recommendation = scoring.get("recommendation")
+    interview_result.red_flags = scoring.get("red_flags")
+    interview_result.raw_scoring_json = scoring
+
+
+async def upsert_interview_result(
+    db: AsyncSession, candidate_id: int, transcript: str, scoring: dict
+) -> InterviewResult:
+    interview_result = await get_interview_result_for_candidate(db, candidate_id)
+    if not interview_result:
+        interview_result = InterviewResult(candidate_id=candidate_id, transcript=transcript)
+        db.add(interview_result)
+    apply_scoring_to_interview(interview_result, transcript, scoring)
+    return interview_result
+
+
 @app.post("/api/interview-complete/{token}")
 async def interview_complete(
     token: str,
@@ -178,28 +222,24 @@ async def interview_complete(
     if not candidate:
         raise HTTPException(404, "Invalid interview token")
 
+    existing_interview = await get_interview_result_for_candidate(db, candidate.id)
+    if candidate.status == "interview_completed" and existing_interview:
+        return {
+            "status": "already_scored",
+            "global_score": candidate.global_score
+            if candidate.global_score is not None
+            else existing_interview.global_score,
+        }
+
     job_result = await db.execute(select(JobConfig).where(JobConfig.id == candidate.job_config_id))
     job = job_result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(500, "No job configuration found")
 
     # Score with Gemini text model
     scoring = await score_interview(body.transcript, job, candidate)
-
-    interview_result = InterviewResult(
-        candidate_id=candidate.id,
-        transcript=body.transcript,
-        summary=scoring.get("summary"),
-        questions=scoring.get("questions"),
-        keyword_coverage=scoring.get("keyword_coverage"),
-        global_score=scoring.get("global_score"),
-        recommendation=scoring.get("recommendation"),
-        red_flags=scoring.get("red_flags"),
-        raw_scoring_json=scoring,
-    )
-    db.add(interview_result)
-
-    candidate.status = "interview_completed"
-    candidate.global_score = scoring.get("global_score")
-    candidate.recommendation = scoring.get("recommendation")
+    await upsert_interview_result(db, candidate.id, body.transcript, scoring)
+    apply_scoring_to_candidate(candidate, scoring)
     await db.commit()
 
     return {"status": "scored", "global_score": scoring.get("global_score")}
@@ -209,12 +249,13 @@ async def score_interview(transcript: str, job: JobConfig, candidate: Candidate)
     api_key = os.getenv("GEMINI_API_KEY")
     scoring_model = os.getenv("SCORING_MODEL", "gemini-2.5-flash-lite")
 
+    mq_texts = [_extract_question_text(q) for q in job.mandatory_questions]
     prompt = f"""You are an expert HR interview evaluator. Analyze this interview transcript and produce a structured evaluation.
 
 Job Title: {job.title}
 Job Description: {job.description}
 Required Keywords: {json.dumps(job.keywords)}
-Mandatory Questions: {json.dumps(job.mandatory_questions)}
+Mandatory Questions: {json.dumps(mq_texts)}
 
 Candidate: {candidate.first_name} {candidate.last_name}
 
@@ -281,24 +322,26 @@ IMPORTANT: Return ONLY valid JSON, no markdown, no extra text."""
 @app.get("/api/candidates")
 async def list_candidates(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(Candidate)
+        select(Candidate, JobConfig.title)
+        .outerjoin(JobConfig, Candidate.job_config_id == JobConfig.id)
         .where(Candidate.status.in_(["interview_completed", "accepted", "rejected_after_interview"]))
         .order_by(Candidate.global_score.desc().nullslast())
     )
-    candidates = result.scalars().all()
+    candidates_with_jobs = result.all()
     return [
         {
-            "id": c.id,
-            "first_name": c.first_name,
-            "last_name": c.last_name,
-            "email": c.email,
-            "status": c.status,
-            "global_score": c.global_score,
-            "recommendation": c.recommendation,
-            "match_percent": c.match_percent,
-            "created_at": str(c.created_at) if c.created_at else None,
+            "id": c.Candidate.id,
+            "first_name": c.Candidate.first_name,
+            "last_name": c.Candidate.last_name,
+            "email": c.Candidate.email,
+            "status": c.Candidate.status,
+            "global_score": c.Candidate.global_score,
+            "recommendation": c.Candidate.recommendation,
+            "match_percent": c.Candidate.match_percent,
+            "job_title": c.title,
+            "created_at": str(c.Candidate.created_at) if c.Candidate.created_at else None,
         }
-        for c in candidates
+        for c in candidates_with_jobs
     ]
 
 
@@ -309,10 +352,7 @@ async def get_candidate(candidate_id: int, db: AsyncSession = Depends(get_db)):
     if not c:
         raise HTTPException(404, "Candidate not found")
 
-    ir_result = await db.execute(
-        select(InterviewResult).where(InterviewResult.candidate_id == candidate_id)
-    )
-    interview = ir_result.scalar_one_or_none()
+    interview = await get_interview_result_for_candidate(db, candidate_id)
 
     return {
         "id": c.id,
@@ -371,23 +411,142 @@ async def candidate_decision(
 
 @app.get("/api/job-config")
 async def get_job_config(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(JobConfig).limit(1))
+    # Keep this for backward compatibility or simple use-cases, but return all active
+    result = await db.execute(select(JobConfig).where(JobConfig.is_active == 1))
+    jobs = result.scalars().all()
+    return jobs
+
+@app.get("/api/job-configs/{config_id}")
+async def get_single_job_config(config_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(JobConfig).where(JobConfig.id == config_id))
     job = result.scalar_one_or_none()
     if not job:
-        raise HTTPException(404, "No job config")
+        raise HTTPException(404, "Config not found")
     return {
         "id": job.id,
         "title": job.title,
         "description": job.description,
         "keywords": job.keywords,
         "mandatory_questions": job.mandatory_questions,
+        "is_active": job.is_active,
     }
+
+
+# ── Job Config CRUD ──────────────────────────────────────
+
+class QuestionItem(BaseModel):
+    question: str
+    expected_themes: list[str] = []
+
+
+class JobConfigCreate(BaseModel):
+    title: str
+    description: str
+    keywords: list[str]
+    mandatory_questions: list[QuestionItem]
+    match_threshold: float = 0.3
+    max_interview_minutes: int = 8
+
+
+class JobConfigUpdate(JobConfigCreate):
+    pass
+
+
+@app.get("/api/job-configs")
+async def list_job_configs(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(JobConfig).order_by(JobConfig.created_at.desc()))
+    configs = result.scalars().all()
+    out = []
+    for j in configs:
+        count_result = await db.execute(
+            select(func.count()).select_from(Candidate).where(Candidate.job_config_id == j.id)
+        )
+        count = count_result.scalar()
+        out.append({
+            "id": j.id, "title": j.title, "description": j.description,
+            "keywords": j.keywords, "mandatory_questions": j.mandatory_questions,
+            "match_threshold": j.match_threshold,
+            "max_interview_minutes": j.max_interview_minutes,
+            "is_active": bool(j.is_active), "candidate_count": count,
+            "created_at": str(j.created_at) if j.created_at else None,
+        })
+    return out
+
+
+@app.post("/api/job-configs")
+async def create_job_config(body: JobConfigCreate, db: AsyncSession = Depends(get_db)):
+    job = JobConfig(
+        title=body.title,
+        description=body.description,
+        keywords=body.keywords,
+        mandatory_questions=[q.model_dump() for q in body.mandatory_questions],
+        match_threshold=body.match_threshold,
+        max_interview_minutes=body.max_interview_minutes,
+        is_active=0,
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return {"id": job.id, "title": job.title}
+
+
+@app.put("/api/job-configs/{config_id}")
+async def update_job_config(config_id: int, body: JobConfigUpdate, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(JobConfig).where(JobConfig.id == config_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(404, "Config not found")
+    job.title = body.title
+    job.description = body.description
+    job.keywords = body.keywords
+    job.mandatory_questions = [q.model_dump() for q in body.mandatory_questions]
+    job.match_threshold = body.match_threshold
+    job.max_interview_minutes = body.max_interview_minutes
+    await db.commit()
+    return {"ok": True}
+
+
+@app.delete("/api/job-configs/{config_id}")
+async def delete_job_config(config_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(JobConfig).where(JobConfig.id == config_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(404, "Config not found")
+    if job.is_active:
+        raise HTTPException(400, "Cannot delete the active config")
+    count_result = await db.execute(
+        select(func.count()).select_from(Candidate).where(Candidate.job_config_id == config_id)
+    )
+    if count_result.scalar() > 0:
+        raise HTTPException(400, "Cannot delete config with linked candidates")
+    await db.delete(job)
+    await db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/job-configs/{config_id}/activate")
+async def activate_job_config(config_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(JobConfig).where(JobConfig.id == config_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(404, "Config not found")
+    
+    # Toggle active state instead of deactivating others
+    job.is_active = 1 if job.is_active == 0 else 0
+    await db.commit()
+    return {"ok": True, "is_active": job.is_active}
 
 
 # ── WebSocket Interview Relay ──────────────────────────────
 
+def _extract_question_text(q) -> str:
+    """Extract question text from either string or dict format."""
+    return q["question"] if isinstance(q, dict) else q
+
+
 def build_system_instruction(ctx: dict) -> str:
-    questions = "\n".join(f"{i+1}. {q}" for i, q in enumerate(ctx["mandatory_questions"]))
+    question_texts = [_extract_question_text(q) for q in ctx["mandatory_questions"]]
+    questions = "\n".join(f"{i+1}. {q}" for i, q in enumerate(question_texts))
     keywords = ", ".join(ctx["keywords"])
     return f"""You are an experienced HR recruiter named Sarah conducting a short phone screen for the position of {ctx["job_title"]}.
 
@@ -448,10 +607,12 @@ def pcm16_mono_to_wav(pcm_bytes: bytes, sample_rate: int = 16000) -> bytes:
     return header + pcm_bytes
 
 
-async def transcribe_audio_with_gemini(audio_chunks: list[str]) -> str:
-    """Transcribe candidate audio chunks using Gemini STT."""
-    api_key = os.getenv("GEMINI_API_KEY")
-    stt_model = os.getenv("STT_MODEL", "gemini-2.5-flash")
+async def transcribe_audio_with_stt_v2(audio_chunks: list[str]) -> str:
+    """Transcribe candidate audio chunks using Google Cloud Speech-to-Text V2."""
+    stt_model = os.getenv("STT_MODEL", "latest_long")
+    stt_language = os.getenv("STT_LANGUAGE_CODE", "en-US")
+    stt_location = os.getenv("STT_LOCATION", "global")
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
 
     if not audio_chunks:
         return ""
@@ -464,23 +625,53 @@ async def transcribe_audio_with_gemini(audio_chunks: list[str]) -> str:
         return ""
 
     wav_bytes = pcm16_mono_to_wav(pcm_buffer, 16000)
-    wav_b64 = base64.b64encode(wav_bytes).decode()
 
-    from google import genai
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=stt_model,
-        contents=[
-            {
-                "role": "user",
-                "parts": [
-                    {"text": "Transcribe this audio exactly. Output only the transcript text, no commentary."},
-                    {"inline_data": {"mime_type": "audio/wav", "data": wav_b64}},
-                ],
-            }
-        ],
-    )
-    return response.text.strip() if response.text else ""
+    if not project_id:
+        try:
+            import google.auth
+
+            _, inferred_project = google.auth.default()
+            project_id = inferred_project
+        except Exception:
+            project_id = None
+
+    if not project_id:
+        print("STT V2 error: GOOGLE_CLOUD_PROJECT is not configured and could not be inferred")
+        return ""
+
+    try:
+        from google.cloud.speech_v2 import SpeechClient
+        from google.cloud.speech_v2.types import cloud_speech
+
+        def do_transcribe() -> str:
+            client = SpeechClient()
+            config = cloud_speech.RecognitionConfig(
+                auto_decoding_config=cloud_speech.AutoDetectDecodingConfig(),
+                language_codes=[stt_language],
+                model=stt_model,
+                features=cloud_speech.RecognitionFeatures(
+                    enable_automatic_punctuation=True,
+                ),
+            )
+            request = cloud_speech.RecognizeRequest(
+                recognizer=f"projects/{project_id}/locations/{stt_location}/recognizers/_",
+                config=config,
+                content=wav_bytes,
+            )
+            response = client.recognize(request=request)
+
+            parts = []
+            for result in response.results:
+                if result.alternatives:
+                    text = result.alternatives[0].transcript.strip()
+                    if text:
+                        parts.append(text)
+            return " ".join(parts).strip()
+
+        return await asyncio.to_thread(do_transcribe)
+    except Exception as e:
+        print(f"STT V2 transcription error: {e}")
+        return ""
 
 
 @app.websocket("/ws/{token}")
@@ -497,6 +688,8 @@ async def websocket_interview(ws: WebSocket, token: str):
         job_result = await db.execute(select(JobConfig).where(JobConfig.id == candidate.job_config_id))
         job = job_result.scalar_one_or_none()
         break
+
+    candidate_id = candidate.id
 
     ctx = {
         "candidate_name": f"{candidate.first_name} {candidate.last_name}",
@@ -662,7 +855,7 @@ async def websocket_interview(ws: WebSocket, token: str):
     try:
         for audio_entry in all_candidate_audio:
             try:
-                stt_text = await transcribe_audio_with_gemini(audio_entry["chunks"])
+                stt_text = await transcribe_audio_with_stt_v2(audio_entry["chunks"])
                 if stt_text:
                     # Find and update the placeholder entry
                     for part in transcript_parts:
@@ -682,22 +875,27 @@ async def websocket_interview(ws: WebSocket, token: str):
 
         if transcript_text.strip():
             async for db in get_db():
-                scoring = await score_interview(transcript_text, job, candidate)
-                interview_result = InterviewResult(
-                    candidate_id=candidate.id,
-                    transcript=transcript_text,
-                    summary=scoring.get("summary"),
-                    questions=scoring.get("questions"),
-                    keyword_coverage=scoring.get("keyword_coverage"),
-                    global_score=scoring.get("global_score"),
-                    recommendation=scoring.get("recommendation"),
-                    red_flags=scoring.get("red_flags"),
-                    raw_scoring_json=scoring,
+                candidate_result = await db.execute(
+                    select(Candidate).where(Candidate.id == candidate_id)
                 )
-                db.add(interview_result)
-                candidate.status = "interview_completed"
-                candidate.global_score = scoring.get("global_score")
-                candidate.recommendation = scoring.get("recommendation")
+                candidate_db = candidate_result.scalar_one_or_none()
+                if not candidate_db:
+                    break
+
+                existing_interview = await get_interview_result_for_candidate(db, candidate_id)
+                if candidate_db.status == "interview_completed" and existing_interview:
+                    break
+
+                job_result = await db.execute(
+                    select(JobConfig).where(JobConfig.id == candidate_db.job_config_id)
+                )
+                job_db = job_result.scalar_one_or_none()
+                if not job_db:
+                    break
+
+                scoring = await score_interview(transcript_text, job_db, candidate_db)
+                await upsert_interview_result(db, candidate_db.id, transcript_text, scoring)
+                apply_scoring_to_candidate(candidate_db, scoring)
                 await db.commit()
                 break
 
