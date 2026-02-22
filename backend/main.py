@@ -11,9 +11,13 @@ import asyncio
 import struct
 import base64
 import re
+import unicodedata
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 import websockets
+import numpy as np
+import spacy
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -38,6 +42,200 @@ async def startup():
 
 
 # ── Helpers ──────────────────────────────────────────────
+_UNICODE_DOT_MAP = str.maketrans({"·": ".", "∙": ".", "•": ".", "․": "."})
+_NON_WORD_RE = re.compile(r"\W")
+_TOKEN_RE = re.compile(r"[a-z0-9.+#/:-]+")
+_TECH_TOKEN_RE = re.compile(r"^[a-z0-9.][a-z0-9.+#/:-]*[a-z0-9+#]$")
+_STOP = {
+    "a", "an", "the", "and", "or", "to", "of", "in", "on", "for", "with", "as", "at", "by",
+    "is", "are", "was", "were", "be", "been", "being", "this", "that", "these", "those",
+    "experience", "years",
+}
+_NLP = None
+_EMBEDDER = None
+_KW_EMB_CACHE: dict[tuple[str, ...], np.ndarray] = {}
+
+
+def _get_nlp():
+    global _NLP
+    if _NLP is None:
+        _NLP = spacy.load("en_core_web_sm", disable=["ner", "parser"])
+    return _NLP
+
+
+def _get_embedder():
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        _EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2")
+    return _EMBEDDER
+
+
+def normalize(s: str) -> str:
+    s = s.lower()
+    s = s.translate(_UNICODE_DOT_MAP)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
+
+
+def prepare_keywords(keywords: list[str]) -> list[tuple[str, bool, Optional[str], Optional[tuple[str, ...]], re.Pattern]]:
+    nlp = _get_nlp()
+    out: list[tuple[str, bool, Optional[str], Optional[tuple[str, ...]], re.Pattern]] = []
+
+    for kw in keywords:
+        kw_n = normalize(kw).strip()
+        if not kw_n:
+            continue
+        is_phrase = " " in kw_n
+        surface_pat = re.compile(rf"(?<!\w){re.escape(kw_n)}(?!\w)")
+
+        if is_phrase:
+            lemmas: list[str] = []
+            for t in nlp(kw_n):
+                if t.is_space or t.is_punct:
+                    continue
+                lem = normalize(t.lemma_)
+                if not lem or lem == "-pron-":
+                    continue
+                lemmas.append(lem)
+            out.append((kw_n, True, None, tuple(lemmas), surface_pat))
+            continue
+
+        if _NON_WORD_RE.search(kw_n):
+            out.append((kw_n, False, None, None, surface_pat))
+            continue
+
+        kw_doc = nlp(kw_n)
+        kw_lemma = normalize(kw_doc[0].lemma_) if len(kw_doc) else kw_n
+        out.append((kw_n, False, kw_lemma, None, surface_pat))
+
+    return out
+
+
+def keyword_match_lemmatized(cv_text: str, keywords: list[str]) -> float:
+    prepared = prepare_keywords(keywords)
+    if not prepared:
+        return 0.0
+
+    nlp = _get_nlp()
+    surface = normalize(cv_text)
+    lemmas_seq: list[str] = []
+    for t in nlp(surface):
+        if t.is_space or t.is_punct:
+            continue
+        lem = normalize(t.lemma_)
+        if not lem or lem == "-pron-":
+            continue
+        lemmas_seq.append(lem)
+
+    lemmas_set = set(lemmas_seq)
+    lemmas_joined = " " + " ".join(lemmas_seq) + " "
+
+    matched = 0
+    for _, is_phrase, single_lemma, phrase_lemmas, surface_pattern in prepared:
+        if is_phrase:
+            phrase = " " + " ".join(phrase_lemmas or ()) + " "
+            if phrase.strip() and phrase in lemmas_joined:
+                matched += 1
+                continue
+            if surface_pattern.search(surface):
+                matched += 1
+            continue
+
+        if single_lemma and single_lemma in lemmas_set:
+            matched += 1
+            continue
+        if surface_pattern.search(surface):
+            matched += 1
+
+    return matched / len(prepared)
+
+
+def cosine_sim_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-12)
+    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-12)
+    return a_norm @ b_norm.T
+
+
+def extract_candidates(cv_text: str) -> list[str]:
+    raw = normalize(cv_text).replace("\n", " ")
+    tokens = _TOKEN_RE.findall(raw)
+
+    token_seq: list[str] = []
+    for tok in tokens:
+        if len(tok) < 2:
+            continue
+        if tok.isdigit():
+            continue
+        if _TECH_TOKEN_RE.match(tok) or tok.isalpha():
+            token_seq.append(tok)
+
+    filtered_seq = [tok for tok in token_seq if tok not in _STOP]
+    ngrams: list[str] = []
+    for n in (2, 3):
+        for i in range(len(token_seq) - n + 1):
+            window = token_seq[i : i + n]
+            if all(tok in _STOP for tok in window):
+                continue
+            ngrams.append(" ".join(window))
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for cand in filtered_seq + ngrams:
+        if cand not in seen:
+            seen.add(cand)
+            out.append(cand)
+    return out
+
+
+def _keyword_embeddings(kws: list[str]) -> np.ndarray:
+    key = tuple(kws)
+    cached = _KW_EMB_CACHE.get(key)
+    if cached is not None:
+        return cached
+    emb = _get_embedder().encode(kws, convert_to_numpy=True, normalize_embeddings=False)
+    _KW_EMB_CACHE[key] = emb
+    return emb
+
+
+def embedding_screen(
+    cv_text: str,
+    keywords: list[str],
+    threshold_single: float = 0.75,
+    threshold_phrase: float = 0.75,
+) -> float:
+    clean_keywords = [normalize(kw).strip() for kw in keywords if kw and kw.strip()]
+    if not clean_keywords:
+        return 0.0
+
+    surface = normalize(cv_text)
+    candidates = extract_candidates(cv_text)
+    if not candidates:
+        return 0.0
+
+    candidate_set = set(candidates)
+    kw_emb = _keyword_embeddings(clean_keywords)
+    cand_emb = _get_embedder().encode(candidates, convert_to_numpy=True, normalize_embeddings=False)
+    sims = cosine_sim_matrix(kw_emb, cand_emb)
+
+    hit = 0
+    for i, kw in enumerate(clean_keywords):
+        if " " in kw:
+            if re.search(rf"(?<!\w){re.escape(kw)}(?!\w)", surface):
+                hit += 1
+                continue
+        elif kw in candidate_set:
+            hit += 1
+            continue
+
+        j = int(np.argmax(sims[i]))
+        best_sim = float(sims[i, j])
+        thr = threshold_phrase if " " in kw else threshold_single
+        if best_sim >= thr:
+            hit += 1
+
+    return hit / len(clean_keywords)
+
 
 def extract_pdf_text(file_bytes: bytes) -> str:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -49,9 +247,32 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 
 
 def keyword_match(cv_text: str, keywords: list[str]) -> float:
-    cv_lower = cv_text.lower()
-    matched = sum(1 for kw in keywords if kw.lower() in cv_lower)
-    return matched / len(keywords) if keywords else 0.0
+    clean_keywords = [kw for kw in keywords if kw and kw.strip()]
+    if not clean_keywords:
+        return 0.0
+
+    lexical_weight = float(os.getenv("MATCH_WEIGHT_LEXICAL", "0.6"))
+    embedding_weight = float(os.getenv("MATCH_WEIGHT_EMBEDDING", "0.4"))
+    emb_threshold_single = float(os.getenv("MATCH_EMBED_THRESHOLD_SINGLE", "0.75"))
+    emb_threshold_phrase = float(os.getenv("MATCH_EMBED_THRESHOLD_PHRASE", "0.75"))
+
+    total_weight = lexical_weight + embedding_weight
+    if total_weight <= 0:
+        lexical_weight, embedding_weight, total_weight = 0.6, 0.4, 1.0
+
+    lexical_score = keyword_match_lemmatized(cv_text, clean_keywords)
+    try:
+        embedding_score = embedding_screen(
+            cv_text=cv_text,
+            keywords=clean_keywords,
+            threshold_single=emb_threshold_single,
+            threshold_phrase=emb_threshold_phrase,
+        )
+    except Exception as e:
+        print(f"Embedding screen fallback to lexical score: {e}")
+        embedding_score = lexical_score
+
+    return ((lexical_weight * lexical_score) + (embedding_weight * embedding_score)) / total_weight
 
 
 def _env_flag(name: str, default: bool) -> bool:
