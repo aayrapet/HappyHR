@@ -150,6 +150,13 @@ async def live_token():
             "model": f"models/{live_model}",
             "config": {
                 "response_modalities": ["AUDIO"],
+                "speech_config": {
+                    "voice_config": {
+                        "prebuilt_voice_config": {
+                            "voice_name": "Aoede"
+                        }
+                    }
+                },
             },
         }
 
@@ -721,6 +728,13 @@ async def websocket_interview(ws: WebSocket, token: str):
                     "model": f"models/{gemini_model}" if not gemini_model.startswith("models/") else gemini_model,
                     "generationConfig": {
                         "responseModalities": ["AUDIO"],
+                        "speechConfig": {
+                            "voiceConfig": {
+                                "prebuiltVoiceConfig": {
+                                    "voiceName": "Aoede"
+                                }
+                            }
+                        },
                     },
                     "systemInstruction": {
                         "parts": [{"text": build_system_instruction(ctx)}]
