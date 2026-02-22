@@ -13,10 +13,24 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Migrate: add is_active column for existing databases
-        try:
-            await conn.execute(text("ALTER TABLE job_configs ADD COLUMN is_active INTEGER DEFAULT 0"))
-        except Exception:
-            pass  # column already exists
+        # Migrate: add new columns for existing databases
+        for stmt in [
+            "ALTER TABLE job_configs ADD COLUMN is_active INTEGER DEFAULT 0",
+            "ALTER TABLE job_configs ADD COLUMN scoring_weights JSON",
+            "ALTER TABLE job_configs ADD COLUMN evaluation_themes JSON",
+            "ALTER TABLE job_configs ADD COLUMN tech_stack JSON",
+            "ALTER TABLE interview_results ADD COLUMN strengths JSON",
+            "ALTER TABLE interview_results ADD COLUMN weaknesses JSON",
+            "ALTER TABLE interview_results ADD COLUMN experience_score FLOAT",
+            "ALTER TABLE interview_results ADD COLUMN technical_score FLOAT",
+            "ALTER TABLE interview_results ADD COLUMN communication_score FLOAT",
+            "ALTER TABLE interview_results ADD COLUMN theme_scores JSON",
+            "ALTER TABLE interview_results ADD COLUMN tech_stack_match VARCHAR",
+        ]:
+            try:
+                await conn.execute(text(stmt))
+            except Exception:
+                pass  # column already exists
         # Ensure at least one config is active
         await conn.execute(text(
             """
