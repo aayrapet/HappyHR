@@ -10,10 +10,10 @@ export default function Home() {
         </p>
         <div className="flex gap-4 justify-center">
           <a
-            href="/apply"
+            href="/jobs"
             className="bg-blue-600 text-white px-8 py-3 rounded-lg font-semibold hover:bg-blue-700 transition-colors"
           >
-            Apply Now
+            Job Posts
           </a>
           <a
             href="/dashboard"

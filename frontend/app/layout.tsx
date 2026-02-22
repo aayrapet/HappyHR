@@ -24,13 +24,27 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
+      <head>
+        <script
+          type="importmap"
+          dangerouslySetInnerHTML={{
+            __html: JSON.stringify({
+              imports: {
+                three: "https://cdn.jsdelivr.net/npm/three@0.183.1/build/three.module.js",
+                "three/addons/":
+                  "https://cdn.jsdelivr.net/npm/three@0.183.1/examples/jsm/",
+              },
+            }),
+          }}
+        />
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         <nav className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
           <a href="/" className="text-xl font-bold text-blue-600">HappyHR</a>
           <div className="flex gap-6 text-sm font-medium text-slate-600">
-            <a href="/apply" className="hover:text-blue-600 transition-colors">Apply</a>
+            <a href="/jobs" className="hover:text-blue-600 transition-colors">Job Posts</a>
             <a href="/dashboard" className="hover:text-blue-600 transition-colors">Dashboard</a>
           </div>
         </nav>

@@ -1,0 +1,8 @@
+Collecting websockets
+  Downloading websockets-16.0-cp314-cp314-win_amd64.whl.metadata (7.0 kB)
+Downloading websockets-16.0-cp314-cp314-win_amd64.whl (178 kB)
+Installing collected packages: websockets
+Successfully installed websockets-16.0
+
+[notice] A new release of pip is available: 25.2 -> 26.0.1
+[notice] To update, run: C:\Users\juliu\AppData\Local\Programs\Python\Python314\python.exe -m pip install --upgrade pip

@@ -60,9 +60,9 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-function downsampleTo16k(float32Buffer: Float32Array, inputSampleRate: number): Float32Array {
-  if (inputSampleRate === 16000) return float32Buffer;
-  const ratio = inputSampleRate / 16000;
+function downsampleTo24k(float32Buffer: Float32Array, inputSampleRate: number): Float32Array {
+  if (inputSampleRate === 24000) return float32Buffer;
+  const ratio = inputSampleRate / 24000;
   const newLength = Math.round(float32Buffer.length / ratio);
   const result = new Float32Array(newLength);
   let offsetResult = 0;
@@ -108,6 +108,7 @@ export default function InterviewPage() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeRef = useRef<number>(0);
   const speakingRef = useRef(false);
+  const speechEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transcriptRef = useRef<TranscriptEntry[]>([]);
 
   // Keep transcriptRef in sync
@@ -237,13 +238,44 @@ export default function InterviewPage() {
           return;
         }
 
+        if (msg.type === "interviewComplete") {
+          // Ignore premature signals — must be at least 90s into the interview
+          const elapsedSec = (Date.now() - startTimeRef.current) / 1000;
+          if (elapsedSec < 90) {
+            console.warn("Ignoring premature interviewComplete signal (only", Math.round(elapsedSec), "s elapsed)");
+            return;
+          }
+          console.log("Interview complete signal received, reason:", msg.reason);
+          // Small delay to let final audio finish playing
+          setTimeout(() => {
+            endInterview();
+          }, 2000);
+          return;
+        }
+
+        if (msg.type === "sessionDropped") {
+          console.warn("Gemini session dropped:", msg.reason);
+          stopPlaybackNow();
+          setError("The interview session was interrupted by the server. Please refresh and try again.");
+          setPhase("error");
+          return;
+        }
+
         if (msg.type === "error") {
           console.error("Server error:", msg.error);
         }
       };
 
-      ws.onclose = () => {
-        console.log("WebSocket closed");
+      ws.onclose = (event) => {
+        console.log("WebSocket closed", event.code, event.reason);
+        // If the interview is still live when the WS closes, it's an unexpected drop
+        setPhase(prev => {
+          if (prev === "live") {
+            setError("Connection lost. Please refresh the page to restart the interview.");
+            return "error";
+          }
+          return prev;
+        });
       };
 
       ws.onerror = () => {
@@ -268,11 +300,20 @@ export default function InterviewPage() {
       // Set up ScriptProcessor with speech detection (from vocal-part)
       const micSource = audioCtx.createMediaStreamSource(micStream);
       micSourceRef.current = micSource;
-      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      const processor = audioCtx.createScriptProcessor(16384, 1, 1);
       processorRef.current = processor;
 
       processor.onaudioprocess = (event: AudioProcessingEvent) => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+
+        // While AI is outputting audio, suppress mic entirely to prevent self-interruption via echo
+        if (activeSourcesRef.current.size > 0) {
+          if (speechEndTimerRef.current) {
+            clearTimeout(speechEndTimerRef.current);
+            speechEndTimerRef.current = null;
+          }
+          return;
+        }
 
         const input = event.inputBuffer.getChannelData(0);
 
@@ -281,26 +322,40 @@ export default function InterviewPage() {
         for (let i = 0; i < input.length; i++) rms += input[i] * input[i];
         rms = Math.sqrt(rms / input.length);
 
-        const speaking = rms > 0.02;
-        if (speaking && !speakingRef.current) {
-          speakingRef.current = true;
-          setIsSpeaking(true);
-          stopPlaybackNow(); // Interrupt AI audio when user speaks
-          wsRef.current.send(JSON.stringify({ type: "speechStart" }));
-        } else if (!speaking && speakingRef.current) {
-          speakingRef.current = false;
-          setIsSpeaking(false);
-          wsRef.current.send(JSON.stringify({ type: "speechEnd" }));
+        const speaking = rms > 0.032;
+        if (speaking) {
+          // Cancel any pending speechEnd debounce — user is still talking
+          if (speechEndTimerRef.current) {
+            clearTimeout(speechEndTimerRef.current);
+            speechEndTimerRef.current = null;
+          }
+          if (!speakingRef.current) {
+            speakingRef.current = true;
+            setIsSpeaking(true);
+            stopPlaybackNow(); // Interrupt AI audio when user speaks
+            wsRef.current.send(JSON.stringify({ type: "speechStart" }));
+          }
+        } else if (speakingRef.current && !speechEndTimerRef.current) {
+          // Debounce: wait 1.5s of silence before committing speechEnd
+          // This prevents false triggers during brief mid-sentence pauses
+          speechEndTimerRef.current = setTimeout(() => {
+            speechEndTimerRef.current = null;
+            speakingRef.current = false;
+            setIsSpeaking(false);
+            if (wsRef.current?.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ type: "speechEnd" }));
+            }
+          }, 2200);
         }
 
         // Downsample and send audio
-        const downsampled = downsampleTo16k(input, audioCtx.sampleRate);
+        const downsampled = downsampleTo24k(input, audioCtx.sampleRate);
         const pcmBytes = floatTo16BitPCM(downsampled);
         const b64 = bytesToBase64(pcmBytes);
 
         wsRef.current.send(JSON.stringify({
           type: "audio",
-          mimeType: "audio/pcm;rate=16000",
+          mimeType: "audio/pcm;rate=24000",
           data: b64,
         }));
       };

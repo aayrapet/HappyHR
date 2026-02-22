@@ -17,6 +17,10 @@ class JobConfig(Base):
     mandatory_questions = Column(JSON, nullable=False)  # list of strings
     match_threshold = Column(Float, default=0.3)
     max_interview_minutes = Column(Integer, default=8)
+    is_active = Column(Integer, default=0)  # 0 or 1, SQLite-friendly boolean
+    scoring_weights = Column(JSON, nullable=True)  # {"experience": 0.4, "technical": 0.4, "communication": 0.2}
+    evaluation_themes = Column(JSON, nullable=True)  # ["backend_design", "scalability", ...]
+    tech_stack = Column(JSON, nullable=True)  # ["python", "docker", "postgres", ...]
     created_at = Column(DateTime, default=func.now())
 
 
@@ -42,7 +46,7 @@ class InterviewResult(Base):
     __tablename__ = "interview_results"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    candidate_id = Column(Integer, nullable=False)
+    candidate_id = Column(Integer, nullable=False, unique=True)
     transcript = Column(Text, nullable=False)
     summary = Column(Text, nullable=True)
     questions = Column(JSON, nullable=True)  # list of question objects
@@ -51,4 +55,11 @@ class InterviewResult(Base):
     recommendation = Column(String, nullable=True)
     red_flags = Column(JSON, nullable=True)
     raw_scoring_json = Column(JSON, nullable=True)
+    strengths = Column(JSON, nullable=True)
+    weaknesses = Column(JSON, nullable=True)
+    experience_score = Column(Float, nullable=True)
+    technical_score = Column(Float, nullable=True)
+    communication_score = Column(Float, nullable=True)
+    theme_scores = Column(JSON, nullable=True)
+    tech_stack_match = Column(String, nullable=True)
     created_at = Column(DateTime, default=func.now())
