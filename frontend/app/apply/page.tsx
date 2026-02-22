@@ -1,19 +1,45 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+interface JobConfig {
+  id: number;
+  title: string;
+  is_active: boolean;
+}
 
 export default function ApplyPage() {
   const [form, setForm] = useState({ first_name: "", last_name: "", email: "" });
   const [file, setFile] = useState<File | null>(null);
+  const [jobs, setJobs] = useState<JobConfig[]>([]);
+  const [jobId, setJobId] = useState<number | "">("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<{ status: string; match_percent: number } | null>(null);
   const [error, setError] = useState("");
 
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(`${API}/api/job-configs`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const activeJobs = (data as JobConfig[]).filter(j => j.is_active);
+        setJobs(activeJobs);
+        if (activeJobs.length > 0) {
+          setJobId(activeJobs[0].id);
+        }
+      } catch {
+        // Keep silent and let submit errors surface to user.
+      }
+    })();
+  }, []);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!file) return setError("Please upload your CV (PDF)");
+    if (!jobId) return setError("Please choose a job offer");
     setLoading(true);
     setError("");
     setResult(null);
@@ -22,6 +48,7 @@ export default function ApplyPage() {
     fd.append("first_name", form.first_name);
     fd.append("last_name", form.last_name);
     fd.append("email", form.email);
+    fd.append("job_id", String(jobId));
     fd.append("cv", file);
 
     try {
@@ -78,6 +105,21 @@ export default function ApplyPage() {
         </div>
       ) : (
         <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1">Job Offer</label>
+            <select
+              required
+              value={jobId}
+              onChange={e => setJobId(e.target.value ? Number(e.target.value) : "")}
+              className="w-full border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
+            >
+              {jobs.length === 0 && <option value="">No active offers available</option>}
+              {jobs.map(j => (
+                <option key={j.id} value={j.id}>{j.title}</option>
+              ))}
+            </select>
+          </div>
+
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-1">First Name</label>
