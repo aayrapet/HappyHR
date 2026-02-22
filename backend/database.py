@@ -19,6 +19,7 @@ async def init_db():
             "ALTER TABLE job_configs ADD COLUMN scoring_weights JSON",
             "ALTER TABLE job_configs ADD COLUMN evaluation_themes JSON",
             "ALTER TABLE job_configs ADD COLUMN tech_stack JSON",
+            "ALTER TABLE interview_results ADD COLUMN summary_candidate TEXT",
             "ALTER TABLE interview_results ADD COLUMN strengths JSON",
             "ALTER TABLE interview_results ADD COLUMN weaknesses JSON",
             "ALTER TABLE interview_results ADD COLUMN experience_score FLOAT",

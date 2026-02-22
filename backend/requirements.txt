@@ -9,3 +9,6 @@ google-cloud-speech==2.33.0
 python-dotenv==1.0.1
 aiosqlite==0.20.0
 websockets>=12.0
+numpy==1.26.4
+spacy==3.7.5
+sentence-transformers==3.3.1

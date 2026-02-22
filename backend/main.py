@@ -1213,7 +1213,7 @@ async def get_candidate(candidate_id: int, db: AsyncSession = Depends(get_db)):
         "global_score": c.global_score,
         "recommendation": c.recommendation,
         "match_percent": c.match_percent,
-        "cv_text": c.cv_text[:2000],
+        "cv_text": c.cv_text[:2000] if c.cv_text else None,
         "created_at": str(c.created_at) if c.created_at else None,
         "interview": {
             "transcript": interview.transcript,

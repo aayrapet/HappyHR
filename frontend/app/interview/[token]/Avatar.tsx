@@ -2,11 +2,11 @@
 
 import {
   useRef,
-  useEffect,
   useImperativeHandle,
   forwardRef,
   useState,
   useCallback,
+  useEffect,
 } from "react";
 
 /* ------------------------------------------------------------------ */
@@ -14,269 +14,232 @@ import {
 /* ------------------------------------------------------------------ */
 
 export interface AvatarHandle {
-  /** Feed a base64-encoded PCM audio chunk for playback + lip sync */
+  /** Feed a base64-encoded PCM audio chunk for playback */
   feedAudio: (base64: string, mimeType?: string) => void;
   /** Stop all audio playback immediately (e.g. user interruption) */
   stopAudio: () => void;
-  /** Initialize the streaming session (call once before feedAudio) */
+  /** Initialize the audio context (call once on user gesture) */
   startStream: () => Promise<void>;
-  /** Returns true once TalkingHead has fully loaded the avatar */
+  /** Always true — no heavy loading needed anymore */
   isReady: () => boolean;
+}
+
+interface AvatarProps {
+  className?: string;
+  onTalkingChange?: (talking: boolean) => void;
 }
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
-function base64ToInt16(base64: string): Int16Array {
+const PCM_SAMPLE_RATE = 24000;
+
+function base64ToFloat32(base64: string): Float32Array {
   const binary = atob(base64);
-  const len = binary.length;
-  const buffer = new ArrayBuffer(len);
-  const bytes = new Uint8Array(buffer);
-  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
-  return new Int16Array(buffer);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const int16 = new Int16Array(bytes.buffer);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    float32[i] = int16[i] / 32768.0;
+  }
+  return float32;
+}
+
+/* ------------------------------------------------------------------ */
+/*  CSS fallback avatar (shown when video files are not present)      */
+/* ------------------------------------------------------------------ */
+
+function FallbackAvatar({ isTalking }: { isTalking: boolean }) {
+  return (
+    <>
+      <style>{`
+        @keyframes sarah-pulse {
+          0%, 100% { transform: scale(1); }
+          50% { transform: scale(1.04); }
+        }
+        .sarah-talking {
+          animation: sarah-pulse 0.5s ease-in-out infinite;
+        }
+      `}</style>
+      <div className="w-full h-full flex items-center justify-center">
+        <div className="w-[400px] h-[400px] rounded-full overflow-hidden">
+          <img
+            src="/avatars/sarah.png"
+            alt="Sarah AI Interviewer"
+            className={`w-full h-full object-cover transition-transform duration-300 ${isTalking ? "sarah-talking" : ""}`}
+          />
+        </div>
+      </div>
+    </>
+  );
 }
 
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
 
-const Avatar = forwardRef<AvatarHandle, { className?: string }>(
-  function Avatar({ className }, ref) {
-    const containerRef = useRef<HTMLDivElement>(null);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const headRef = useRef<any>(null);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const headAudioRef = useRef<any>(null);
-    const animFrameRef = useRef<number>(0);
-    const lastTimeRef = useRef<number>(0);
-    const mountedRef = useRef(true);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState<string | null>(null);
-    const failedRef = useRef(false);
+const Avatar = forwardRef<AvatarHandle, AvatarProps>(
+  function Avatar({ className, onTalkingChange }, ref) {
+    const idleVideoRef = useRef<HTMLVideoElement>(null);
+    const talkingVideoRef = useRef<HTMLVideoElement>(null);
+    const audioCtxRef = useRef<AudioContext | null>(null);
+    const nextStartTimeRef = useRef<number>(0);
+    const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
 
-    /* ---- Initialise TalkingHead only (HeadAudio set up in startStream) ---- */
+    const [isTalking, setIsTalking] = useState(false);
+    // 'checking' → 'video' | 'fallback'
+    const [videoMode, setVideoMode] = useState<"checking" | "video" | "fallback">("checking");
+
+    /* ---- Notify parent of talking state changes ---- */
     useEffect(() => {
-      mountedRef.current = true;
+      onTalkingChange?.(isTalking);
+    }, [isTalking, onTalkingChange]);
 
-      // Suppress Next.js dev overlay for TalkingHead errors
-      const onError = (e: ErrorEvent) => {
-        if (e.message?.includes("TalkingHead") || e.message?.includes("Blend shapes") || e.message?.includes("three")) {
-          e.preventDefault();
-        }
-      };
-      const onRejection = (e: PromiseRejectionEvent) => {
-        const msg = e.reason?.message || String(e.reason);
-        if (msg.includes("TalkingHead") || msg.includes("Blend shapes") || msg.includes("three")) {
-          e.preventDefault();
-        }
-      };
-      window.addEventListener("error", onError);
-      window.addEventListener("unhandledrejection", onRejection);
+    /* ---- Detect if video files exist ---- */
+    useEffect(() => {
+      let resolved = false;
 
-      const init = async () => {
-        try {
-          const thUrl = "/modules/talkinghead.mjs";
-          const thMod = await import(/* webpackIgnore: true */ thUrl);
-          const TalkingHead = thMod.TalkingHead;
-          if (!mountedRef.current || !containerRef.current) return;
-
-          let head: ReturnType<typeof TalkingHead>;
-          try {
-            head = new TalkingHead(containerRef.current, {
-              pcmSampleRate: 24000,
-              lipsyncModules: ["en"],
-              lipsyncLang: "en",
-              cameraView: "upper",
-              modelFPS: 30,
-              cameraRotateEnable: false,
-              cameraPanEnable: false,
-              cameraZoomEnable: false,
-              lightAmbientIntensity: 2,
-              lightDirectIntensity: 30,
-              avatarMood: "neutral",
-              avatarIdleEyeContact: 0.6,
-              avatarIdleHeadMove: 0.6,
-              avatarSpeakingEyeContact: 0.8,
-              avatarSpeakingHeadMove: 0.4,
-            });
-          } catch (constructErr) {
-            console.warn("TalkingHead constructor failed:", constructErr);
-            if (mountedRef.current) {
-              failedRef.current = true;
-              setError("Avatar engine failed to initialize");
-              setLoading(false);
-            }
-            return;
-          }
-
-          try {
-            await head.showAvatar(
-              {
-                url: "/avatars/sarah.glb",
-                body: "F",
-                avatarMood: "neutral",
-                lipsyncLang: "en",
-              },
-              (ev: ProgressEvent) => {
-                if (ev.lengthComputable) {
-                  const pct = Math.round((ev.loaded / ev.total) * 100);
-                  console.log(`Avatar loading: ${pct}%`);
-                }
-              }
-            );
-          } catch (avatarErr) {
-            console.warn("showAvatar failed:", avatarErr);
-            if (mountedRef.current) {
-              failedRef.current = true;
-              setError("Avatar model failed to load");
-              setLoading(false);
-            }
-            return;
-          }
-
-          headRef.current = head;
-
-          // Animation frame loop — drives HeadAudio viseme smoothing once HeadAudio is ready
-          const tick = (time: number) => {
-            if (!mountedRef.current) return;
-            const dt = lastTimeRef.current ? time - lastTimeRef.current : 16;
-            lastTimeRef.current = time;
-            headAudioRef.current?.update(dt);
-            animFrameRef.current = requestAnimationFrame(tick);
-          };
-          animFrameRef.current = requestAnimationFrame(tick);
-
-          if (mountedRef.current) setLoading(false);
-        } catch (err) {
-          console.error("Avatar init error:", err);
-          if (mountedRef.current) {
-            failedRef.current = true;
-            setError(err instanceof Error ? err.message : "Failed to load avatar");
-            setLoading(false);
-          }
+      const resolve = (mode: "video" | "fallback") => {
+        if (!resolved) {
+          resolved = true;
+          setVideoMode(mode);
         }
       };
 
-      init();
+      fetch("/avatars/sarah-idle.mp4", { method: "HEAD" })
+        .then((res) => resolve(res.ok ? "video" : "fallback"))
+        .catch(() => resolve("fallback"));
 
-      return () => {
-        mountedRef.current = false;
-        window.removeEventListener("error", onError);
-        window.removeEventListener("unhandledrejection", onRejection);
-        if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
-        try { headAudioRef.current?.stop(); } catch { /* */ }
-        try { headRef.current?.stop(); } catch { /* */ }
-      };
+      // Safety timeout: fall back to CSS avatar after 2 s if fetch hangs
+      setTimeout(() => resolve("fallback"), 2000);
     }, []);
 
-    /* ---- Imperative API exposed to parent ---- */
+    /* ---- Sync video playback with talking state ---- */
+    useEffect(() => {
+      if (videoMode !== "video") return;
+
+      if (isTalking) {
+        idleVideoRef.current?.pause();
+        talkingVideoRef.current?.play().catch(() => {});
+      } else {
+        talkingVideoRef.current?.pause();
+        idleVideoRef.current?.play().catch(() => {});
+      }
+    }, [isTalking, videoMode]);
+
+    /* ---- Imperative API ---- */
 
     const startStream = useCallback(async () => {
-      const head = headRef.current;
-      if (!head) return;
-
-      // Stop existing HeadAudio before re-initialising (e.g. interview restart)
-      if (headAudioRef.current) {
-        try { headAudioRef.current.stop(); } catch { /* */ }
-        headAudioRef.current = null;
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new AudioContext();
       }
-
-      // streamStart may call initAudioGraph(24000) which recreates head.audioCtx
-      // and all audio nodes — so HeadAudio MUST be set up AFTER this call.
-      await head.streamStart({
-        sampleRate: 24000,
-        lipsyncLang: "en",
-      });
-
-      // ---- Set up HeadAudio with the (possibly new) AudioContext ----
-      try {
-        const audioCtx = head.audioCtx as AudioContext;
-
-        // The worklet module must be added to the current AudioContext
-        await audioCtx.audioWorklet.addModule("/modules/headworklet.mjs");
-
-        const haUrl = "/modules/headaudio.mjs";
-        const haMod = await import(/* webpackIgnore: true */ haUrl);
-        const HeadAudio = haMod.HeadAudio;
-
-        const headAudio = new HeadAudio(audioCtx);
-        await headAudio.loadModel("/modules/model-en-mixed.bin");
-
-        // Route TalkingHead's stream audio into HeadAudio for viseme analysis
-        if (head.audioStreamGainNode) {
-          head.audioStreamGainNode.connect(headAudio);
-        } else if (head.audioAnalyzerNode) {
-          head.audioAnalyzerNode.connect(headAudio);
-        }
-
-        // When HeadAudio detects a viseme, update TalkingHead's morph targets
-        headAudio.onvalue = (visemeName: string, value: number) => {
-          const h = headRef.current;
-          if (!h || !h.mtAvatar) return;
-          const mt = h.mtAvatar[visemeName];
-          if (mt) {
-            mt.realtime = value > 0.01 ? value : null;
-            mt.needsUpdate = true;
-          }
-        };
-
-        headAudio.start();
-        headAudioRef.current = headAudio;
-      } catch (err) {
-        // HeadAudio is optional — avatar still works, just without audio-driven visemes
-        console.warn("HeadAudio setup failed, lip sync will be limited:", err);
+      if (audioCtxRef.current.state === "suspended") {
+        await audioCtxRef.current.resume();
       }
+      nextStartTimeRef.current = 0;
     }, []);
 
     const feedAudio = useCallback((base64: string) => {
-      const head = headRef.current;
-      if (!head) return;
-      const int16 = base64ToInt16(base64);
-      head.streamAudio({ audio: int16 });
+      // Lazily create the AudioContext on first audio chunk (Avatar may not have
+      // been rendered yet when startStream() was called from startInterview).
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new AudioContext();
+        nextStartTimeRef.current = 0;
+      }
+      const ctx = audioCtxRef.current;
+      // Resume if the browser suspended it due to autoplay policy.
+      if (ctx.state === "suspended") {
+        ctx.resume().catch(() => {});
+      }
+
+      const float32 = base64ToFloat32(base64);
+
+      const buffer = ctx.createBuffer(1, float32.length, PCM_SAMPLE_RATE);
+      buffer.getChannelData(0).set(float32);
+
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+
+      const now = ctx.currentTime;
+      const startTime = nextStartTimeRef.current > now ? nextStartTimeRef.current : now;
+      source.start(startTime);
+      nextStartTimeRef.current = startTime + buffer.duration;
+
+      activeSourcesRef.current.add(source);
+      setIsTalking(true);
+
+      source.onended = () => {
+        activeSourcesRef.current.delete(source);
+        if (activeSourcesRef.current.size === 0) {
+          setIsTalking(false);
+          nextStartTimeRef.current = 0;
+        }
+      };
     }, []);
 
     const stopAudio = useCallback(() => {
-      const head = headRef.current;
-      if (!head) return;
-      try {
-        head.streamInterrupt();
-      } catch {
-        /* ignore if not streaming */
-      }
+      const sources = [...activeSourcesRef.current];
+      activeSourcesRef.current.clear();
+      sources.forEach((source) => {
+        source.onended = null;
+        try {
+          source.stop();
+        } catch {
+          /* already ended */
+        }
+      });
+      nextStartTimeRef.current = 0;
+      setIsTalking(false);
     }, []);
 
-    const isReady = useCallback(() => headRef.current !== null || failedRef.current, []);
+    const isReady = useCallback(() => true, []);
 
-    useImperativeHandle(ref, () => ({ feedAudio, stopAudio, startStream, isReady }), [
-      feedAudio,
-      stopAudio,
-      startStream,
-      isReady,
-    ]);
+    useImperativeHandle(
+      ref,
+      () => ({ feedAudio, stopAudio, startStream, isReady }),
+      [feedAudio, stopAudio, startStream, isReady]
+    );
 
     /* ---- Render ---- */
     return (
-      <div className={`relative ${className ?? ""}`}>
-        <div
-          ref={containerRef}
-          className="w-full h-full"
-          style={{ minHeight: 300 }}
-        />
-        {loading && (
-          <div className="absolute inset-0 flex items-center justify-center bg-slate-100/80">
-            <div className="text-slate-500 text-sm flex items-center gap-2">
-              <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24" fill="none">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-              Loading avatar...
-            </div>
+      <div className={`relative ${className ?? ""}`} style={{ minHeight: 300 }}>
+        {/* Video mode */}
+        {videoMode === "video" && (
+          <div className="absolute inset-0">
+            <video
+              ref={idleVideoRef}
+              src="/avatars/sarah-idle.mp4"
+              loop
+              muted
+              playsInline
+              autoPlay
+              className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-200 ${
+                isTalking ? "opacity-0" : "opacity-100"
+              }`}
+            />
+            <video
+              ref={talkingVideoRef}
+              src="/avatars/sarah-talking.mp4"
+              loop
+              muted
+              playsInline
+              className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-200 ${
+                isTalking ? "opacity-100" : "opacity-0"
+              }`}
+            />
           </div>
         )}
-        {error && (
-          <div className="absolute inset-0 flex items-center justify-center bg-red-50/80">
-            <p className="text-red-600 text-sm">Avatar error: {error}</p>
+
+        {/* CSS fallback */}
+        {videoMode === "fallback" && <FallbackAvatar isTalking={isTalking} />}
+
+        {/* Loading placeholder */}
+        {videoMode === "checking" && (
+          <div className="absolute inset-0 flex items-center justify-center bg-slate-100">
+            <div className="text-slate-400 text-sm">Loading...</div>
           </div>
         )}
       </div>

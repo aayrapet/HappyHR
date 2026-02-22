@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams } from "next/navigation";
+import Avatar, { AvatarHandle } from "./Avatar";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -21,24 +22,7 @@ interface InterviewContext {
   max_interview_minutes: number;
 }
 
-// ── Audio helpers (from vocal-part) ──────────────────────
-
-function int16ToFloat32(int16: Int16Array): Float32Array {
-  const f32 = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) {
-    f32[i] = int16[i] / 32768;
-  }
-  return f32;
-}
-
-function base64ToInt16(base64: string): Int16Array {
-  const binary = atob(base64);
-  const len = binary.length;
-  const buffer = new ArrayBuffer(len);
-  const bytes = new Uint8Array(buffer);
-  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
-  return new Int16Array(buffer);
-}
+// ── Audio helpers (mic encoding) ─────────────────────────
 
 function floatTo16BitPCM(float32Array: Float32Array): Uint8Array {
   const buffer = new ArrayBuffer(float32Array.length * 2);
@@ -95,15 +79,14 @@ export default function InterviewPage() {
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [error, setError] = useState("");
   const [elapsed, setElapsed] = useState(0);
-  const [isSpeaking, setIsSpeaking] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const playbackTimeRef = useRef(0);
-  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const avatarRef = useRef<AvatarHandle>(null);
+  const aiSpeakingRef = useRef(false);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeRef = useRef<number>(0);
@@ -140,43 +123,10 @@ export default function InterviewPage() {
     })();
   }, [token]);
 
-  // ── Playback controls (from vocal-part) ──
+  // ── Playback controls (delegated to Avatar) ──
 
   const stopPlaybackNow = useCallback(() => {
-    for (const src of activeSourcesRef.current) {
-      try { src.stop(0); } catch { /* ignore */ }
-    }
-    activeSourcesRef.current.clear();
-    if (audioCtxRef.current) {
-      playbackTimeRef.current = audioCtxRef.current.currentTime;
-    }
-  }, []);
-
-  const playPcmBase64 = useCallback((base64: string, mimeType: string = "audio/pcm;rate=24000") => {
-    const audioCtx = audioCtxRef.current;
-    if (!audioCtx) return;
-
-    const sampleRateMatch = /rate=(\d+)/.exec(mimeType);
-    const sampleRate = sampleRateMatch ? Number(sampleRateMatch[1]) : 24000;
-
-    const pcm16 = base64ToInt16(base64);
-    const audioData = int16ToFloat32(pcm16);
-
-    const buffer = audioCtx.createBuffer(1, audioData.length, sampleRate);
-    buffer.copyToChannel(new Float32Array(audioData.buffer as ArrayBuffer), 0);
-
-    const source = audioCtx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioCtx.destination);
-
-    if (playbackTimeRef.current < audioCtx.currentTime) {
-      playbackTimeRef.current = audioCtx.currentTime;
-    }
-    source.start(playbackTimeRef.current);
-    playbackTimeRef.current += buffer.duration;
-
-    activeSourcesRef.current.add(source);
-    source.onended = () => activeSourcesRef.current.delete(source);
+    avatarRef.current?.stopAudio();
   }, []);
 
   // ── Start interview ──
@@ -228,7 +178,7 @@ export default function InterviewPage() {
         }
 
         if (msg.type === "audio") {
-          playPcmBase64(msg.data, msg.mimeType);
+          avatarRef.current?.feedAudio(msg.data, msg.mimeType);
           return;
         }
 
@@ -278,14 +228,14 @@ export default function InterviewPage() {
         });
       };
 
-      ws.onerror = () => {
-        console.error("WebSocket error");
+      ws.onerror = (event) => {
+        console.warn("WebSocket error", event);
       };
 
-      // Set up audio context
+      // Initialize Avatar audio (playback context) and mic audio context
+      await avatarRef.current?.startStream();
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       audioCtxRef.current = audioCtx;
-      playbackTimeRef.current = audioCtx.currentTime;
 
       // Get microphone
       const micStream = await navigator.mediaDevices.getUserMedia({
@@ -307,7 +257,7 @@ export default function InterviewPage() {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
 
         // While AI is outputting audio, suppress mic entirely to prevent self-interruption via echo
-        if (activeSourcesRef.current.size > 0) {
+        if (aiSpeakingRef.current) {
           if (speechEndTimerRef.current) {
             clearTimeout(speechEndTimerRef.current);
             speechEndTimerRef.current = null;
@@ -331,7 +281,6 @@ export default function InterviewPage() {
           }
           if (!speakingRef.current) {
             speakingRef.current = true;
-            setIsSpeaking(true);
             stopPlaybackNow(); // Interrupt AI audio when user speaks
             wsRef.current.send(JSON.stringify({ type: "speechStart" }));
           }
@@ -341,7 +290,6 @@ export default function InterviewPage() {
           speechEndTimerRef.current = setTimeout(() => {
             speechEndTimerRef.current = null;
             speakingRef.current = false;
-            setIsSpeaking(false);
             if (wsRef.current?.readyState === WebSocket.OPEN) {
               wsRef.current.send(JSON.stringify({ type: "speechEnd" }));
             }
@@ -480,15 +428,14 @@ export default function InterviewPage() {
 
   // Live phase
   return (
-    <div className="flex flex-col h-[calc(100vh-57px)]">
+    <div className="flex flex-col h-[calc(100vh-57px)] bg-slate-900">
       {/* Top bar */}
-      <div className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
+      <div className="bg-slate-800 px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <div className={`w-3 h-3 rounded-full ${isSpeaking ? "bg-green-500 animate-pulse" : "bg-red-500 animate-pulse"}`} />
-          <span className="font-semibold text-slate-900">
-            {isSpeaking ? "You are speaking..." : "Interview in Progress"}
+          <span className="font-semibold text-slate-200 text-sm">
+            Interview
           </span>
-          <span className="text-slate-500 text-sm">{formatTime(elapsed)}</span>
+          <span className="text-slate-400 text-sm">{formatTime(elapsed)}</span>
         </div>
         <button
           onClick={endInterview}
@@ -499,35 +446,13 @@ export default function InterviewPage() {
         </button>
       </div>
 
-      {/* Transcript */}
-      <div className="flex-1 overflow-y-auto p-6">
-        <div className="max-w-2xl mx-auto space-y-4">
-          {transcript.length === 0 && (
-            <p className="text-center text-slate-400 mt-8">
-              The AI interviewer will start speaking shortly...
-            </p>
-          )}
-          {transcript.map((entry, i) => (
-            <div
-              key={i}
-              className={`flex ${entry.role === "user" ? "justify-end" : "justify-start"}`}
-            >
-              <div
-                className={`max-w-[80%] rounded-2xl px-4 py-3 ${
-                  entry.role === "user"
-                    ? "bg-blue-600 text-white"
-                    : "bg-white border border-slate-200 text-slate-800"
-                }`}
-              >
-                <p className="text-xs font-medium mb-1 opacity-70">
-                  {entry.role === "user" ? "You" : "Sarah (AI)"}
-                </p>
-                <p className="text-sm">{entry.text}</p>
-              </div>
-            </div>
-          ))}
-          <div ref={transcriptEndRef} />
-        </div>
+      {/* Avatar — full remaining height */}
+      <div className="flex-1 flex items-center justify-center">
+        <Avatar
+          ref={avatarRef}
+          className="w-full h-full"
+          onTalkingChange={(talking) => { aiSpeakingRef.current = talking; }}
+        />
       </div>
     </div>
   );

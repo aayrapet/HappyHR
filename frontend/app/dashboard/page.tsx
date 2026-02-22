@@ -379,8 +379,8 @@ export default function DashboardPage() {
       const res = await fetch(`${API}/api/candidate/${id}`);
       const data = await res.json();
       setSelected(data);
-    } catch {
-      console.error("Failed to fetch candidate detail");
+    } catch (err) {
+      console.warn("Failed to fetch candidate detail", err);
     }
   };
 
@@ -585,14 +585,14 @@ export default function DashboardPage() {
                 {selected.interview ? (
                   <>
                     {/* Score Overview */}
-                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
-                      <div className="bg-white rounded-xl p-4 border border-slate-200">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-7 gap-4 mb-6">
+                      <div className="bg-white rounded-xl p-5 border border-slate-200 min-h-[140px]">
                         <p className="text-sm text-slate-500">Global Score</p>
                         <p className={`text-3xl font-bold ${scoreColor(selected.interview.global_score)}`}>
                           {selected.interview.global_score}/100
                         </p>
                       </div>
-                      <div className="bg-white rounded-xl p-4 border border-slate-200">
+                      <div className="bg-white rounded-xl p-5 border border-slate-200 min-h-[140px] xl:col-span-2">
                         <p className="text-sm text-slate-500">Recommendation</p>
                         <p className="text-lg font-semibold text-slate-900 capitalize">
                           {selected.interview.recommendation?.replace("_", " ")}
@@ -613,25 +613,25 @@ export default function DashboardPage() {
                           </p>
                         )}
                       </div>
-                      <div className="bg-white rounded-xl p-4 border border-slate-200">
+                      <div className="bg-white rounded-xl p-5 border border-slate-200 min-h-[140px]">
                         <p className="text-sm text-slate-500">CV Match</p>
                         <p className="text-3xl font-bold text-blue-600">{selected.match_percent}%</p>
                       </div>
-                      <div className="bg-white rounded-xl p-4 border border-slate-200">
+                      <div className="bg-white rounded-xl p-5 border border-slate-200 min-h-[140px]">
                         <p className="text-sm text-slate-500">Experience</p>
                         <p className="text-3xl font-bold text-slate-900">
                           {selected.interview.experience_score !== undefined ? selected.interview.experience_score : "-"}
                           <span className="text-base text-slate-500">/10</span>
                         </p>
                       </div>
-                      <div className="bg-white rounded-xl p-4 border border-slate-200">
+                      <div className="bg-white rounded-xl p-5 border border-slate-200 min-h-[140px]">
                         <p className="text-sm text-slate-500">Technical</p>
                         <p className="text-3xl font-bold text-slate-900">
                           {selected.interview.technical_score !== undefined ? selected.interview.technical_score : "-"}
                           <span className="text-base text-slate-500">/10</span>
                         </p>
                       </div>
-                      <div className="bg-white rounded-xl p-4 border border-slate-200">
+                      <div className="bg-white rounded-xl p-5 border border-slate-200 min-h-[140px]">
                         <p className="text-sm text-slate-500">Communication</p>
                         <p className="text-3xl font-bold text-slate-900">
                           {selected.interview.communication_score !== undefined ? selected.interview.communication_score : "-"}
