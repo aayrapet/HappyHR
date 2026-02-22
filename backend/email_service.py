@@ -64,12 +64,24 @@ def send_rejection_email(to_email: str, name: str, job_title: str):
     send_email(to_email, subject, body)
 
 
-def send_decision_email(to_email: str, name: str, job_title: str, decision: str):
+def send_decision_email(
+    to_email: str,
+    name: str,
+    job_title: str,
+    decision: str,
+    summary_candidate: str | None = None,
+):
+    feedback_block = (
+        f"<p><strong>Interview feedback:</strong> {summary_candidate}</p>"
+        if summary_candidate
+        else ""
+    )
     if decision == "accept":
         subject = f"HappyHR - Great News About Your {job_title} Application!"
         body = f"""
         <h2>Hi {name},</h2>
         <p>We're pleased to inform you that you've been <strong>selected</strong> for the <strong>{job_title}</strong> position!</p>
+        {feedback_block}
         <p>Our team will reach out shortly with next steps.</p>
         <p>Congratulations!<br>The HappyHR Team</p>
         """
@@ -78,6 +90,7 @@ def send_decision_email(to_email: str, name: str, job_title: str, decision: str)
         body = f"""
         <h2>Hi {name},</h2>
         <p>Thank you for completing the interview for the <strong>{job_title}</strong> position.</p>
+        {feedback_block}
         <p>After careful consideration, we've decided to proceed with other candidates.</p>
         <p>We wish you the best in your job search.</p>
         <p>Best regards,<br>The HappyHR Team</p>

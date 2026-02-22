@@ -11,6 +11,13 @@ async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Lightweight migration for existing SQLite DBs.
+        cols = await conn.exec_driver_sql("PRAGMA table_info(interview_results)")
+        col_names = {row[1] for row in cols.fetchall()}
+        if "summary_candidate" not in col_names:
+            await conn.exec_driver_sql(
+                "ALTER TABLE interview_results ADD COLUMN summary_candidate TEXT"
+            )
 
     async with async_session() as session:
         from sqlalchemy import select

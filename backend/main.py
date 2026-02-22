@@ -188,6 +188,7 @@ async def interview_complete(
         candidate_id=candidate.id,
         transcript=body.transcript,
         summary=scoring.get("summary"),
+        summary_candidate=scoring.get("summary_candidate"),
         questions=scoring.get("questions"),
         keyword_coverage=scoring.get("keyword_coverage"),
         global_score=scoring.get("global_score"),
@@ -224,6 +225,7 @@ TRANSCRIPT:
 Produce a JSON response with EXACTLY this structure:
 {{
   "summary": "2-3 sentence overall summary of the candidate's performance",
+  "summary_candidate": "2-3 polite and concise sentences addressed to the candidate, with constructive feedback and no internal hiring rationale",
   "questions": [
     {{
       "question_id": "q1",
@@ -268,6 +270,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown, no extra text."""
         print(f"Scoring error: {e}")
         return {
             "summary": "Scoring failed due to an error.",
+            "summary_candidate": "Thank you for your interview. We appreciate your time and will get back to you soon.",
             "questions": [],
             "keyword_coverage": [],
             "global_score": 50,
@@ -328,6 +331,7 @@ async def get_candidate(candidate_id: int, db: AsyncSession = Depends(get_db)):
         "interview": {
             "transcript": interview.transcript,
             "summary": interview.summary,
+            "summary_candidate": interview.summary_candidate,
             "questions": interview.questions,
             "keyword_coverage": interview.keyword_coverage,
             "global_score": interview.global_score,
@@ -339,6 +343,7 @@ async def get_candidate(candidate_id: int, db: AsyncSession = Depends(get_db)):
 
 class DecisionRequest(BaseModel):
     decision: str  # "accept" or "reject"
+    summary_candidate: Optional[str] = None
 
 
 @app.post("/api/candidate/{candidate_id}/decision")
@@ -357,12 +362,27 @@ async def candidate_decision(
 
     job_result = await db.execute(select(JobConfig).where(JobConfig.id == c.job_config_id))
     job = job_result.scalar_one_or_none()
+    ir_result = await db.execute(
+        select(InterviewResult).where(InterviewResult.candidate_id == candidate_id)
+    )
+    interview = ir_result.scalar_one_or_none()
 
     new_status = "accepted" if body.decision == "accept" else "rejected_after_interview"
     c.status = new_status
     await db.commit()
 
-    send_decision_email(c.email, c.first_name, job.title if job else "the position", body.decision)
+    summary_for_email = (
+        body.summary_candidate
+        or (interview.summary_candidate if interview else None)
+        or (interview.summary if interview else None)
+    )
+    send_decision_email(
+        c.email,
+        c.first_name,
+        job.title if job else "the position",
+        body.decision,
+        summary_for_email,
+    )
 
     return {"status": new_status}
 
@@ -687,6 +707,7 @@ async def websocket_interview(ws: WebSocket, token: str):
                     candidate_id=candidate.id,
                     transcript=transcript_text,
                     summary=scoring.get("summary"),
+                    summary_candidate=scoring.get("summary_candidate"),
                     questions=scoring.get("questions"),
                     keyword_coverage=scoring.get("keyword_coverage"),
                     global_score=scoring.get("global_score"),
