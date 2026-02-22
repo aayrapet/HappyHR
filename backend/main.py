@@ -10,6 +10,7 @@ import json
 import asyncio
 import struct
 import base64
+import re
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 import websockets
@@ -51,6 +52,523 @@ def keyword_match(cv_text: str, keywords: list[str]) -> float:
     cv_lower = cv_text.lower()
     matched = sum(1 for kw in keywords if kw.lower() in cv_lower)
     return matched / len(keywords) if keywords else 0.0
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _clamp_float(value, minimum: float, maximum: float, default: float) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = default
+    return max(minimum, min(maximum, numeric))
+
+
+def _normalize_string_list(value, max_items: int = 12, max_len: int = 160) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = str(item).strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        out.append(text[:max_len])
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _normalize_keyword_hits(value) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in value:
+        keyword = ""
+        evidence = ""
+        if isinstance(item, dict):
+            keyword = str(item.get("keyword", "")).strip()
+            evidence = str(item.get("evidence", "")).strip()
+        elif isinstance(item, str):
+            keyword = item.strip()
+        if not keyword:
+            continue
+        out.append({"keyword": keyword[:120], "evidence": evidence[:400]})
+    return out
+
+
+def _normalize_live_memory_event(raw_args, tool_call_id: str, event_index: int | None = None) -> dict:
+    args = raw_args
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+
+    question_id_raw = str(args.get("question_id", "")).strip().lower()
+    if not question_id_raw:
+        question_id_raw = "unknown"
+    question_id = re.sub(r"[^a-z0-9_]+", "_", question_id_raw).strip("_") or "unknown"
+    question_type = str(args.get("question_type", "")).strip().lower()
+    if question_type not in {"mandatory", "cv", "followup", "candidate_question", "other"}:
+        if question_id == "cv_q":
+            question_type = "cv"
+        elif re.match(r"^q\d+$", question_id):
+            question_type = "mandatory"
+        elif question_id.startswith("fup_"):
+            question_type = "followup"
+        else:
+            question_type = "other"
+
+    question_text = str(args.get("question_text", "")).strip()[:280]
+    answer_summary = str(args.get("answer_summary", "")).strip()[:1200]
+
+    event = {
+        "tool_call_id": tool_call_id,
+        "event_index": int(event_index) if event_index is not None else None,
+        "question_id": question_id,
+        "question_type": question_type,
+        "question_text": question_text,
+        "answer_summary": answer_summary,
+        "question_score": _clamp_float(args.get("question_score"), 0.0, 5.0, 2.5),
+        "keyword_hits": _normalize_keyword_hits(args.get("keyword_hits")),
+        "expected_themes_covered": _normalize_string_list(args.get("expected_themes_covered")),
+        "expected_themes_missing": _normalize_string_list(args.get("expected_themes_missing")),
+        "experience_signal": _clamp_float(args.get("experience_signal"), 0.0, 10.0, 5.0),
+        "technical_signal": _clamp_float(args.get("technical_signal"), 0.0, 10.0, 5.0),
+        "communication_signal": _clamp_float(args.get("communication_signal"), 0.0, 10.0, 5.0),
+        "strengths": _normalize_string_list(args.get("strengths")),
+        "weaknesses": _normalize_string_list(args.get("weaknesses")),
+        "red_flags": _normalize_string_list(args.get("red_flags")),
+        "confidence": _clamp_float(args.get("confidence"), 0.0, 1.0, 0.6),
+    }
+    return event
+
+
+def _question_sort_key(question_id: str):
+    if question_id == "cv_q":
+        return (0, 0)
+    match = re.match(r"^q(\d+)$", question_id)
+    if match:
+        return (1, int(match.group(1)))
+    return (2, question_id)
+
+
+def _collapse_live_memory_events(events: list[dict]) -> list[dict]:
+    latest_by_question: dict[str, dict] = {}
+    for event in events:
+        qid = str(event.get("question_id", "")).strip()
+        if not qid:
+            continue
+        latest_by_question[qid] = event
+    return sorted(latest_by_question.values(), key=lambda e: _question_sort_key(str(e.get("question_id", ""))))
+
+
+def _sort_live_memory_events(events: list[dict]) -> list[dict]:
+    def sort_key(event: dict):
+        raw_idx = event.get("event_index")
+        if isinstance(raw_idx, int):
+            idx = raw_idx
+        else:
+            try:
+                idx = int(raw_idx)
+            except (TypeError, ValueError):
+                idx = 10**9
+        return (idx, _question_sort_key(str(event.get("question_id", ""))))
+
+    return sorted(events, key=sort_key)
+
+
+def _weighted_average(values: list[tuple[float, float]], default: float) -> float:
+    if not values:
+        return default
+    weighted_sum = 0.0
+    total_weight = 0.0
+    for value, weight in values:
+        w = max(0.0, float(weight))
+        weighted_sum += float(value) * w
+        total_weight += w
+    if total_weight <= 0:
+        return sum(float(v) for v, _ in values) / len(values)
+    return weighted_sum / total_weight
+
+
+def _recommendation_from_global(global_score: float) -> str:
+    if global_score < 55:
+        return "no"
+    if global_score < 65:
+        return "maybe"
+    if global_score < 80:
+        return "yes"
+    return "strong_yes"
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        normalized = item.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(normalized)
+    return out
+
+
+def _build_live_memory_tools() -> list[dict]:
+    """Return tool definitions in OpenAI Realtime API format."""
+    return [
+        {
+            "type": "function",
+            "name": "record_question_assessment",
+            "description": (
+                "Record a structured, non-verbatim assessment right after a candidate "
+                "answer is completed for one interview question."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question_id": {"type": "string"},
+                    "question_type": {"type": "string"},
+                    "question_text": {"type": "string"},
+                    "answer_summary": {"type": "string"},
+                    "question_score": {"type": "number"},
+                    "keyword_hits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "keyword": {"type": "string"},
+                                "evidence": {"type": "string"},
+                            },
+                            "required": ["keyword", "evidence"],
+                        },
+                    },
+                    "expected_themes_covered": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "expected_themes_missing": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "experience_signal": {"type": "number"},
+                    "technical_signal": {"type": "number"},
+                    "communication_signal": {"type": "number"},
+                    "strengths": {"type": "array", "items": {"type": "string"}},
+                    "weaknesses": {"type": "array", "items": {"type": "string"}},
+                    "red_flags": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "number"},
+                },
+                "required": [
+                    "question_id",
+                    "question_type",
+                    "question_text",
+                    "answer_summary",
+                    "question_score",
+                    "keyword_hits",
+                    "expected_themes_covered",
+                    "expected_themes_missing",
+                    "experience_signal",
+                    "technical_signal",
+                    "communication_signal",
+                    "strengths",
+                    "weaknesses",
+                    "red_flags",
+                    "confidence",
+                ],
+            },
+        },
+        {
+            "type": "function",
+            "name": "end_interview",
+            "description": (
+                "End the interview session. Call this ONCE after you have said your "
+                "final goodbye to the candidate, or if the candidate explicitly "
+                "requests to stop, or if the candidate is not authorized to work."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the interview is ending: 'completed', 'candidate_requested', or 'not_authorized'",
+                    }
+                },
+                "required": ["reason"],
+            },
+        },
+    ]
+
+
+def validate_live_memory_events(
+    events: list[dict], mandatory_questions: list, min_events: int
+) -> tuple[bool, str]:
+    if len(events) < min_events:
+        return False, f"insufficient_live_memory_events:{len(events)}<{min_events}"
+
+    mandatory_ids = {f"q{i + 1}" for i, _ in enumerate(mandatory_questions or [])}
+    if mandatory_ids and not any(e.get("question_id") in mandatory_ids for e in events):
+        return False, "no_mandatory_question_assessment"
+
+    collapsed = _collapse_live_memory_events(events)
+    if not collapsed:
+        return False, "no_valid_live_memory_events"
+    return True, "ok"
+
+
+def build_structured_transcript_from_live_memory(
+    transcript_parts: list[dict], events: list[dict]
+) -> str:
+    lines = ["[Structured non-verbatim interview notes]", ""]
+
+    ai_lines = [
+        p.get("text", "").strip()
+        for p in sorted(transcript_parts, key=lambda p: p.get("index", 0))
+        if p.get("role") == "ai" and p.get("text")
+    ]
+    if ai_lines:
+        lines.append("Interviewer prompts:")
+        for text in ai_lines:
+            lines.append(f"- {text}")
+        lines.append("")
+
+    ordered_events = _sort_live_memory_events(events)
+    if ordered_events:
+        lines.append("Candidate response summaries:")
+        for event in ordered_events:
+            question_id = event.get("question_id", "unknown")
+            question_type = event.get("question_type", "other")
+            question_text = event.get("question_text") or "[Question unavailable]"
+            answer_summary = event.get("answer_summary") or "[No summary captured]"
+            sequence = event.get("event_index")
+            seq_prefix = f"#{sequence} " if sequence is not None else ""
+            lines.append(f"- {seq_prefix}{question_id} ({question_type}): {question_text}")
+            lines.append(f"  Candidate summary: {answer_summary}")
+    else:
+        lines.append("Candidate response summaries:")
+        lines.append("- No structured memory events were captured.")
+
+    return "\n".join(lines).strip()
+
+
+def score_interview_from_live_memory(events: list[dict], job: JobConfig, candidate: Candidate) -> dict:
+    weights = job.scoring_weights or {"experience": 0.4, "technical": 0.4, "communication": 0.2}
+    question_text_by_id = {
+        f"q{i + 1}": _extract_question_text(q) for i, q in enumerate(job.mandatory_questions or [])
+    }
+    ordered_events = _sort_live_memory_events(events)
+
+    question_assessments: list[dict] = []
+    strengths: list[str] = []
+    weaknesses: list[str] = []
+    red_flags: list[str] = []
+    keyword_evidence_map: dict[str, str] = {}
+
+    for event in ordered_events:
+        question_id = event.get("question_id", "unknown")
+        question_type = event.get("question_type", "other")
+        question_text = event.get("question_text") or question_text_by_id.get(question_id, "")
+        question_score = round(_clamp_float(event.get("question_score"), 0.0, 5.0, 2.5), 1)
+        experience_signal = round(_clamp_float(event.get("experience_signal"), 0.0, 10.0, 5.0), 1)
+        technical_signal = round(_clamp_float(event.get("technical_signal"), 0.0, 10.0, 5.0), 1)
+        communication_signal = round(_clamp_float(event.get("communication_signal"), 0.0, 10.0, 5.0), 1)
+        confidence = round(_clamp_float(event.get("confidence"), 0.0, 1.0, 0.6), 2)
+        expected_themes_covered = _normalize_string_list(event.get("expected_themes_covered"), max_items=20)
+        expected_themes_missing = _normalize_string_list(event.get("expected_themes_missing"), max_items=20)
+
+        evidence: list[str] = []
+        for hit in event.get("keyword_hits", []):
+            keyword = str(hit.get("keyword", "")).strip()
+            hit_evidence = str(hit.get("evidence", "")).strip()
+            if keyword:
+                lowered = keyword.lower()
+                if hit_evidence and lowered not in keyword_evidence_map:
+                    keyword_evidence_map[lowered] = hit_evidence
+                evidence.append(f"{keyword}: {hit_evidence}" if hit_evidence else keyword)
+
+        if expected_themes_covered:
+            evidence.append("Covered themes: " + ", ".join(expected_themes_covered))
+        if expected_themes_missing:
+            evidence.append("Missing themes: " + ", ".join(expected_themes_missing))
+        if not evidence:
+            evidence = ["No explicit evidence captured in structured memory."]
+
+        question_assessments.append(
+            {
+                "sequence": len(question_assessments) + 1,
+                "question_id": question_id,
+                "question_type": question_type,
+                "question_text": question_text,
+                "answer_summary": event.get("answer_summary", ""),
+                "score": question_score,
+                "experience_signal": experience_signal,
+                "technical_signal": technical_signal,
+                "communication_signal": communication_signal,
+                "confidence": confidence,
+                "expected_themes_covered": expected_themes_covered,
+                "expected_themes_missing": expected_themes_missing,
+                "evidence": evidence,
+            }
+        )
+
+        strengths.extend(event.get("strengths", []))
+        weaknesses.extend(event.get("weaknesses", []))
+        red_flags.extend(event.get("red_flags", []))
+
+    keyword_coverage = []
+    for keyword in job.keywords or []:
+        lowered = keyword.lower()
+        evidence = keyword_evidence_map.get(lowered, "")
+        keyword_coverage.append(
+            {
+                "keyword": keyword,
+                "evidence": evidence,
+                "score": 1 if evidence else 0,
+            }
+        )
+
+    experience_score = round(
+        _weighted_average(
+            [(float(e.get("experience_signal", 5.0)), float(e.get("confidence", 0.6))) for e in ordered_events],
+            5.0,
+        ),
+        1,
+    )
+    technical_score = round(
+        _weighted_average(
+            [(float(e.get("technical_signal", 5.0)), float(e.get("confidence", 0.6))) for e in ordered_events],
+            5.0,
+        ),
+        1,
+    )
+    communication_score = round(
+        _weighted_average(
+            [(float(e.get("communication_signal", 5.0)), float(e.get("confidence", 0.6))) for e in ordered_events],
+            5.0,
+        ),
+        1,
+    )
+
+    theme_scores = {}
+    for theme in job.evaluation_themes or []:
+        theme_lower = theme.lower()
+        covered_weight = 0.0
+        missing_weight = 0.0
+        for event in ordered_events:
+            weight = float(event.get("confidence", 0.6))
+            covered_list = [t.lower() for t in event.get("expected_themes_covered", [])]
+            missing_list = [t.lower() for t in event.get("expected_themes_missing", [])]
+            if theme_lower in covered_list:
+                covered_weight += weight
+            if theme_lower in missing_list:
+                missing_weight += weight
+
+        if covered_weight == 0 and missing_weight == 0:
+            theme_score = 5.0
+        else:
+            theme_score = _clamp_float(5.0 + covered_weight * 1.8 - missing_weight * 1.5, 0.0, 10.0, 5.0)
+        theme_scores[theme] = round(theme_score, 1)
+
+    tech_stack_present = 0
+    tech_stack_total = len(job.tech_stack or [])
+    tech_stack_notes = ""
+    tech_stack_match = None
+    if tech_stack_total > 0:
+        all_hits = set()
+        all_summaries = " ".join(str(e.get("answer_summary", "")).lower() for e in ordered_events)
+        for event in ordered_events:
+            for hit in event.get("keyword_hits", []):
+                all_hits.add(str(hit.get("keyword", "")).lower())
+        for tech in job.tech_stack:
+            tech_lower = str(tech).lower()
+            if tech_lower in all_hits or tech_lower in all_summaries:
+                tech_stack_present += 1
+
+        ratio = tech_stack_present / tech_stack_total
+        if ratio > 0.75:
+            tech_stack_match = "strong"
+        elif ratio >= 0.5:
+            tech_stack_match = "good"
+        elif ratio >= 0.25:
+            tech_stack_match = "partial"
+        else:
+            tech_stack_match = "weak"
+        tech_stack_notes = (
+            f"Candidate showed evidence for {tech_stack_present}/{tech_stack_total} required technologies."
+        )
+
+    w_exp = float(weights.get("experience", 0.4))
+    w_tech = float(weights.get("technical", 0.4))
+    w_comm = float(weights.get("communication", 0.2))
+    global_score = round(
+        _clamp_float(
+            (experience_score * w_exp + technical_score * w_tech + communication_score * w_comm) * 10.0,
+            0.0,
+            100.0,
+            50.0,
+        ),
+        1,
+    )
+    recommendation = _recommendation_from_global(global_score)
+
+    strengths = _dedupe_preserve_order(strengths)[:8]
+    weaknesses = _dedupe_preserve_order(weaknesses)[:8]
+    red_flags = _dedupe_preserve_order(red_flags)[:8]
+
+    if question_assessments:
+        by_type: dict[str, int] = {}
+        for qa in question_assessments:
+            qtype = str(qa.get("question_type") or "other")
+            by_type[qtype] = by_type.get(qtype, 0) + 1
+        type_summary = ", ".join(f"{k}: {v}" for k, v in sorted(by_type.items()))
+        summary_parts = [
+            f"Structured live-memory evaluation for {candidate.first_name} {candidate.last_name} across {len(question_assessments)} assessed exchanges."
+        ]
+        if type_summary:
+            summary_parts.append(f"Assessment breakdown by question type ({type_summary}).")
+        if strengths:
+            summary_parts.append("Strengths observed: " + "; ".join(strengths[:3]) + ".")
+        if weaknesses:
+            summary_parts.append("Areas to improve: " + "; ".join(weaknesses[:3]) + ".")
+        summary = " ".join(summary_parts)
+    else:
+        summary = "Structured live-memory evaluation was attempted but contained no assessable question events."
+
+    return {
+        "summary": summary,
+        "questions": question_assessments,
+        "question_assessments": question_assessments,
+        "keyword_coverage": keyword_coverage,
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "experience_score": experience_score,
+        "technical_score": technical_score,
+        "communication_score": communication_score,
+        "global_score": global_score,
+        "recommendation": recommendation,
+        "red_flags": red_flags,
+        "theme_scores": theme_scores,
+        "tech_stack_match": tech_stack_match,
+        "tech_stack_present": tech_stack_present if tech_stack_total else None,
+        "tech_stack_total": tech_stack_total if tech_stack_total else None,
+        "tech_stack_notes": tech_stack_notes if tech_stack_total else "",
+        "live_memory_event_count": len(ordered_events),
+    }
 
 
 # ── Apply ────────────────────────────────────────────────
@@ -252,6 +770,7 @@ async def interview_complete(
 
     # Score with Gemini text model
     scoring = await score_interview(body.transcript, job, candidate)
+    scoring["scoring_source"] = scoring.get("scoring_source") or "manual_transcript"
     await upsert_interview_result(db, candidate.id, body.transcript, scoring)
     apply_scoring_to_candidate(candidate, scoring)
     await db.commit()
@@ -444,6 +963,11 @@ async def get_candidate(candidate_id: int, db: AsyncSession = Depends(get_db)):
             "transcript": interview.transcript,
             "summary": interview.summary,
             "questions": interview.questions,
+            "question_assessments": (
+                interview.raw_scoring_json.get("question_assessments") or interview.questions
+                if isinstance(interview.raw_scoring_json, dict)
+                else interview.questions
+            ),
             "keyword_coverage": interview.keyword_coverage,
             "global_score": interview.global_score,
             "recommendation": interview.recommendation,
@@ -455,6 +979,22 @@ async def get_candidate(candidate_id: int, db: AsyncSession = Depends(get_db)):
             "communication_score": interview.communication_score,
             "theme_scores": interview.theme_scores,
             "tech_stack_match": interview.tech_stack_match,
+            "scoring_source": (
+                interview.raw_scoring_json.get("scoring_source")
+                if isinstance(interview.raw_scoring_json, dict)
+                else None
+            ),
+            "fallback_reason": (
+                interview.raw_scoring_json.get("fallback_reason")
+                if isinstance(interview.raw_scoring_json, dict)
+                else None
+            ),
+            "live_memory_event_count": (
+                len(interview.raw_scoring_json.get("live_memory_events", []))
+                if isinstance(interview.raw_scoring_json, dict)
+                and isinstance(interview.raw_scoring_json.get("live_memory_events"), list)
+                else None
+            ),
         } if interview else None,
     }
 
@@ -755,11 +1295,42 @@ PHASE 5 -FAREWELL:
 - Thank the candidate warmly for their time.
 - Let them know they will hear back soon.
 - End the conversation gracefully.
+- After your farewell message, you MUST call the `end_interview` tool with reason="completed".
+
+============================================
+INTERVIEW TERMINATION (MANDATORY)
+============================================
+- After you finish your farewell in Phase 5, call `end_interview(reason="completed")`. This ends the session.
+- If the candidate says they want to stop at ANY point (e.g. "I'm done", "I want to stop", "end the interview", "I'd like to leave", "that's enough"), politely acknowledge, thank them for their time, then call `end_interview(reason="candidate_requested")`.
+- If the candidate is not authorized to work (Phase 1 rejection), after delivering the rejection message, call `end_interview(reason="not_authorized")`.
+- NEVER continue the interview after calling `end_interview`.
+
+============================================
+LIVE MEMORY TOOLING (MANDATORY)
+============================================
+- You MUST call the function `record_question_assessment` exactly once after each finalized substantive candidate answer across the interview phases.
+- Keep canonical IDs for primary questions:
+  - CV question: `question_id` = "cv_q", `question_type` = "cv".
+  - Mandatory questions: `question_id` = "q1", "q2", etc., `question_type` = "mandatory".
+- For additional assessed exchanges (follow-ups, candidate questions, spontaneous technical probes), still call the function with unique IDs such as:
+  - follow-up: `question_id` = "fup_<n>", `question_type` = "followup"
+  - candidate question: `question_id` = "candq_<n>", `question_type` = "candidate_question"
+  - other: `question_id` = "extra_<n>", `question_type` = "other"
+- Call the function only once after each finalized answer segment.
+- Keep `answer_summary` non-verbatim and factual. Never invent details.
+- Fill all fields with strict ranges:
+  - `question_score`: 0-5
+  - `experience_signal`, `technical_signal`, `communication_signal`: 0-10
+  - `confidence`: 0-1
+- `keyword_hits` must only include job-relevant evidence observed during the interview.
+- `expected_themes_covered` and `expected_themes_missing` must reflect the question's expected themes.
+- If evidence is weak, lower scores and include concerns in `weaknesses` or `red_flags`.
 
 ============================================
 CONVERSATION STYLE RULES
 ============================================
 - Ask ONE question at a time. Never combine multiple questions.
+- After asking a question, you MUST stop speaking and wait for the candidate's answer. Do NOT ask a second question immediately.
 - Keep responses concise and natural -this is a phone conversation, not an essay.
 - When transitioning between questions, always give a brief human-like comment on their previous answer FIRST ("Interesting.", "That's helpful.", "Good to hear.", "We value that kind of experience.") before asking the next question.
 - Probe for evidence of these keywords through natural conversation: {keywords}
@@ -775,13 +1346,9 @@ SAFETY / FAIRNESS RULES
 - Do NOT invent or assume details from the candidate's CV that are not explicitly stated."""
 
 
-def build_gemini_ws_url() -> str:
-    api_key = os.getenv("GEMINI_API_KEY")
-    return (
-        "wss://generativelanguage.googleapis.com/ws/"
-        "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-        f"?key={api_key}"
-    )
+def build_openai_ws_url() -> str:
+    model = os.getenv("LIVE_MODEL", "gpt-realtime")
+    return f"wss://api.openai.com/v1/realtime?model={model}"
 
 
 def pcm16_mono_to_wav(pcm_bytes: bytes, sample_rate: int = 16000) -> bytes:
@@ -836,7 +1403,7 @@ async def transcribe_audio_with_stt_v2(audio_chunks: list[str]) -> str:
                 config=cloud_speech.RecognitionConfig(
                     explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
                         encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
-                        sample_rate_hertz=16000,
+                        sample_rate_hertz=24000,
                         audio_channel_count=1,
                     ),
                     language_codes=["en-US"],
@@ -864,6 +1431,60 @@ async def transcribe_audio_with_stt_v2(audio_chunks: list[str]) -> str:
         print(f"[STT] ERROR during Google Cloud STT transcription: {e}")
         traceback.print_exc()
         return ""
+
+
+async def build_transcript_from_stt_segments(
+    all_candidate_audio: list[dict], transcript_parts: list[dict]
+) -> str:
+    parts = [dict(p) for p in transcript_parts]
+    print(
+        f"[POST] Audio segments to transcribe: {len(all_candidate_audio)}, "
+        f"AI transcript parts: {len([p for p in parts if p['role'] == 'ai'])}"
+    )
+
+    async def _transcribe_one(i: int, audio_entry: dict) -> tuple[int, int, str]:
+        try:
+            print(
+                f"[POST] Transcribing audio segment {i + 1}/{len(all_candidate_audio)} "
+                f"(index={audio_entry['index']}, chunks={len(audio_entry['chunks'])})"
+            )
+            stt_text = await transcribe_audio_with_stt_v2(audio_entry["chunks"])
+            print(
+                f"[POST] STT result for segment {i + 1}: '{stt_text[:80]}...'"
+                if len(stt_text) > 80
+                else f"[POST] STT result for segment {i + 1}: '{stt_text}'"
+            )
+            return (i, audio_entry["index"], stt_text)
+        except Exception as e:
+            import traceback
+            print(f"[POST] STT error for segment {i + 1}: {e}")
+            traceback.print_exc()
+            return (i, audio_entry["index"], "")
+
+    results = await asyncio.gather(
+        *[_transcribe_one(i, entry) for i, entry in enumerate(all_candidate_audio)]
+    )
+
+    for _, idx, stt_text in results:
+        if stt_text:
+            for part in parts:
+                if part.get("index") == idx and part["role"] == "user":
+                    part["text"] = stt_text
+                    break
+
+    parts.sort(key=lambda p: p.get("index", 0))
+    filled_parts = [p for p in parts if p.get("text")]
+    print(
+        f"[POST] Transcript parts after STT: {len(filled_parts)} non-empty "
+        f"(of {len(parts)} total)"
+    )
+
+    transcript_text = "\n\n".join(
+        f"{'Interviewer' if p['role'] == 'ai' else 'Candidate'}: {p['text']}"
+        for p in filled_parts
+    )
+    print(f"[POST] Final transcript length: {len(transcript_text)} chars")
+    return transcript_text
 
 
 @app.websocket("/ws/{token}")
@@ -906,99 +1527,213 @@ async def websocket_interview(ws: WebSocket, token: str):
 
     await ws.accept()
 
-    gemini_model = os.getenv("LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
-    gemini_url = build_gemini_ws_url()
+    openai_url = build_openai_ws_url()
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        await ws.send_json({"type": "error", "error": "OPENAI_API_KEY not configured"})
+        await ws.close()
+        return
 
     # Track transcript for scoring
     model_text_buffer = ""
     transcript_parts = []  # list of {"role": "ai"|"user", "text": str, "index": int}
     candidate_audio_chunks = []  # current speech segment
     all_candidate_audio = []  # list of {"index": int, "chunks": list[str]}
+    live_memory_events = []  # list of normalized record_question_assessment payloads
     turn_index = 0
+    # Accumulate streamed function-call arguments per call_id
+    pending_tool_calls = {}  # {call_id: {"name": str, "arguments": str}}
 
     try:
-        async with websockets.connect(gemini_url) as gemini_ws:
-            # Send setup message
-            setup_msg = {
-                "setup": {
-                    "model": f"models/{gemini_model}" if not gemini_model.startswith("models/") else gemini_model,
-                    "generationConfig": {
-                        "responseModalities": ["AUDIO"],
-                        "speechConfig": {
-                            "voiceConfig": {
-                                "prebuiltVoiceConfig": {
-                                    "voiceName": "Aoede"
-                                }
-                            }
-                        },
-                    },
-                    "systemInstruction": {
-                        "parts": [{"text": build_system_instruction(ctx)}]
-                    },
-                }
-            }
-            await gemini_ws.send(json.dumps(setup_msg))
-
-            # Wait for setupComplete (loop in case other messages arrive first)
+        async with websockets.connect(
+            openai_url,
+            additional_headers={
+                "Authorization": f"Bearer {openai_api_key}",
+                "OpenAI-Beta": "realtime=v1",
+            },
+        ) as oai_ws:
+            # Wait for session.created
             while True:
-                setup_response = await gemini_ws.recv()
-                setup_data = json.loads(setup_response)
-                print(f"[WS] Gemini setup response: {list(setup_data.keys())}")
-                if setup_data.get("setupComplete") is not None:
+                init_raw = await oai_ws.recv()
+                init_msg = json.loads(init_raw)
+                print(f"[WS] OpenAI init: type={init_msg.get('type')}")
+                if init_msg.get("type") == "session.created":
                     break
 
-            await ws.send_json({"type": "status", "message": "Connected to Gemini Live API"})
-            print("[WS] Setup complete, sending initial trigger to Gemini")
-
-            # Send initial trigger so Gemini starts the interview
-            await gemini_ws.send(json.dumps({
-                "clientContent": {
-                    "turns": [{"role": "user", "parts": [{"text": "Hello, I'm ready to start the interview."}]}],
-                    "turnComplete": True,
-                }
+            # Send session.update with instructions, tools, VAD, voice
+            await oai_ws.send(json.dumps({
+                "type": "session.update",
+                "session": {
+                    "instructions": build_system_instruction(ctx),
+                    "modalities": ["text", "audio"],
+                    "voice": "alloy",
+                    "input_audio_format": "pcm16",
+                    "output_audio_format": "pcm16",
+                    "tools": _build_live_memory_tools(),
+                    "tool_choice": "auto",
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 1200,
+                    },
+                },
             }))
 
-            async def gemini_to_client():
-                """Forward Gemini messages to the browser client."""
-                nonlocal model_text_buffer, turn_index
-                try:
-                    async for raw in gemini_ws:
-                        msg = json.loads(raw)
-                        print(f"[WS] Gemini → client: keys={list(msg.keys())}")
+            # Wait for session.updated
+            while True:
+                upd_raw = await oai_ws.recv()
+                upd_msg = json.loads(upd_raw)
+                print(f"[WS] OpenAI update: type={upd_msg.get('type')}")
+                if upd_msg.get("type") == "session.updated":
+                    break
 
-                        parts = msg.get("serverContent", {}).get("modelTurn", {}).get("parts", [])
-                        for part in parts:
-                            inline = part.get("inlineData")
-                            if inline and inline.get("data") and inline.get("mimeType", "").startswith("audio/pcm"):
-                                print(f"[WS] Sending audio chunk to client ({len(inline['data'])} b64 bytes)")
+            await ws.send_json({"type": "status", "message": "Connected to OpenAI Realtime API"})
+            print("[WS] Session configured, sending initial trigger")
+
+            # Send initial user message to start the interview
+            await oai_ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hello, I'm ready to start the interview."}],
+                },
+            }))
+            await oai_ws.send(json.dumps({"type": "response.create"}))
+
+            async def openai_to_client():
+                """Forward OpenAI Realtime events to the browser client."""
+                nonlocal model_text_buffer, turn_index, live_memory_events, pending_tool_calls
+                try:
+                    async for raw in oai_ws:
+                        msg = json.loads(raw)
+                        evt = msg.get("type", "")
+
+                        # ── Audio delta ──
+                        if evt == "response.audio.delta":
+                            delta = msg.get("delta", "")
+                            if delta:
                                 await ws.send_json({
                                     "type": "audio",
-                                    "mimeType": inline["mimeType"],
-                                    "data": inline["data"],
+                                    "mimeType": "audio/pcm;rate=24000",
+                                    "data": delta,
                                 })
 
-                            text = part.get("text")
-                            if text:
-                                model_text_buffer += (" " if model_text_buffer else "") + text
-                                await ws.send_json({"type": "text", "text": text})
+                        # ── Text transcript delta ──
+                        elif evt == "response.audio_transcript.delta":
+                            delta = msg.get("delta", "")
+                            if delta:
+                                model_text_buffer += delta
+                                await ws.send_json({"type": "text", "text": delta})
 
-                        if msg.get("serverContent", {}).get("turnComplete"):
+                        # ── Response done (turn complete) ──
+                        elif evt == "response.done":
                             if model_text_buffer.strip():
                                 transcript_parts.append({"role": "ai", "text": model_text_buffer.strip(), "index": turn_index})
                                 turn_index += 1
+                                print(f"[AI]: {model_text_buffer.strip()[:120]}...")
                                 model_text_buffer = ""
                             await ws.send_json({"type": "turnComplete"})
 
-                        if msg.get("error"):
-                            await ws.send_json({"type": "error", "error": msg["error"]})
+                        # ── Function call arguments streaming ──
+                        elif evt == "response.function_call_arguments.delta":
+                            call_id = msg.get("call_id", "")
+                            if call_id not in pending_tool_calls:
+                                pending_tool_calls[call_id] = {"name": msg.get("name", ""), "arguments": ""}
+                            pending_tool_calls[call_id]["arguments"] += msg.get("delta", "")
+
+                        # ── Function call complete ──
+                        elif evt == "response.function_call_arguments.done":
+                            call_id = msg.get("call_id", "")
+                            call_name = msg.get("name", "") or pending_tool_calls.get(call_id, {}).get("name", "")
+                            raw_args = msg.get("arguments", "") or pending_tool_calls.get(call_id, {}).get("arguments", "")
+                            pending_tool_calls.pop(call_id, None)
+
+                            try:
+                                args = json.loads(raw_args) if raw_args else {}
+                            except json.JSONDecodeError:
+                                args = {}
+
+                            output = '{"status": "ignored"}'
+
+                            if call_name == "record_question_assessment":
+                                try:
+                                    normalized_event = _normalize_live_memory_event(
+                                        args, call_id, len(live_memory_events) + 1
+                                    )
+                                    live_memory_events.append(normalized_event)
+                                    output = json.dumps({"status": "ok", "recorded": True, "question_id": normalized_event.get("question_id")})
+                                    print(
+                                        f"[WS] Recorded live memory event for question_id="
+                                        f"{normalized_event.get('question_id')} (total={len(live_memory_events)})"
+                                    )
+                                except Exception as e:
+                                    output = json.dumps({"status": "error", "error": str(e)})
+
+                            elif call_name == "end_interview":
+                                reason = args.get("reason", "completed") if isinstance(args, dict) else "completed"
+                                print(f"[WS] end_interview tool called, reason={reason}")
+                                output = json.dumps({"status": "ok", "reason": reason})
+                                try:
+                                    await ws.send_json({"type": "interviewComplete", "reason": reason})
+                                except Exception:
+                                    pass
+
+                            # Send function output back + trigger continuation
+                            await oai_ws.send(json.dumps({
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "function_call_output",
+                                    "call_id": call_id,
+                                    "output": output,
+                                },
+                            }))
+                            await oai_ws.send(json.dumps({"type": "response.create"}))
+
+                        # ── Server VAD speech events (for STT chunking) ──
+                        elif evt == "input_audio_buffer.speech_started":
+                            print("[WS] Server VAD: user speech started")
+                            candidate_audio_chunks = []
+
+                        elif evt == "input_audio_buffer.speech_stopped":
+                            print("[WS] Server VAD: user speech stopped")
+                            if candidate_audio_chunks:
+                                idx = turn_index
+                                turn_index += 1
+                                all_candidate_audio.append({"index": idx, "chunks": list(candidate_audio_chunks)})
+                                transcript_parts.append({"role": "user", "text": "", "index": idx})
+                            candidate_audio_chunks = []
+
+                        # ── User transcript from server ──
+                        elif evt == "conversation.item.input_audio_transcription.completed":
+                            user_text = msg.get("transcript", "").strip()
+                            if user_text:
+                                print(f"[User]: {user_text[:120]}")
+                                # Update the last user placeholder with actual text
+                                for i in range(len(transcript_parts) - 1, -1, -1):
+                                    if transcript_parts[i]["role"] == "user" and not transcript_parts[i]["text"]:
+                                        transcript_parts[i]["text"] = user_text
+                                        break
+
+                        # ── Errors ──
+                        elif evt == "error":
+                            err_detail = msg.get("error", {})
+                            err_msg = err_detail.get("message", str(err_detail)) if isinstance(err_detail, dict) else str(err_detail)
+                            print(f"[WS] OpenAI error: {err_msg}")
+                            await ws.send_json({"type": "error", "error": err_msg})
 
                 except websockets.ConnectionClosed as e:
-                    print(f"[WS] Gemini connection closed: {e}")
+                    print(f"[WS] OpenAI connection closed: {e}")
+                    try:
+                        await ws.send_json({"type": "sessionDropped", "reason": str(e)})
+                    except Exception:
+                        pass
                 except Exception as e:
-                    print(f"[WS] gemini_to_client error: {e}")
+                    print(f"[WS] openai_to_client error: {e}")
 
-            async def client_to_gemini():
-                """Forward browser client messages to Gemini."""
+            async def client_to_openai():
+                """Forward browser client audio to OpenAI Realtime API."""
                 nonlocal candidate_audio_chunks, turn_index
                 try:
                     while True:
@@ -1006,60 +1741,43 @@ async def websocket_interview(ws: WebSocket, token: str):
                         msg = json.loads(data)
 
                         if msg.get("type") == "audio" and msg.get("data"):
-                            # Store audio for STT
+                            # Store audio for STT fallback
                             candidate_audio_chunks.append(msg["data"])
-                            # Forward to Gemini
-                            await gemini_ws.send(json.dumps({
-                                "realtimeInput": {
-                                    "mediaChunks": [{
-                                        "mimeType": msg.get("mimeType", "audio/pcm;rate=16000"),
-                                        "data": msg["data"],
-                                    }]
-                                }
+                            # Forward to OpenAI
+                            await oai_ws.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": msg["data"],
                             }))
-
-                        elif msg.get("type") == "speechStart":
-                            candidate_audio_chunks = []
-
-                        elif msg.get("type") == "speechEnd":
-                            # Require at least 6 chunks (~2s) to avoid transcribing noise bursts
-                            MIN_SPEECH_CHUNKS = 6
-                            if len(candidate_audio_chunks) >= MIN_SPEECH_CHUNKS:
-                                idx = turn_index
-                                turn_index += 1
-                                all_candidate_audio.append({"index": idx, "chunks": list(candidate_audio_chunks)})
-                                # Add placeholder in transcript
-                                transcript_parts.append({"role": "user", "text": "", "index": idx})
-                            else:
-                                print(f"[WS] Discarded short segment ({len(candidate_audio_chunks)} chunks < {MIN_SPEECH_CHUNKS})")
-                            candidate_audio_chunks = []
 
                         elif msg.get("type") == "text" and msg.get("text"):
                             transcript_parts.append({"role": "user", "text": msg["text"], "index": turn_index})
+                            print(f"[User text]: {msg['text']}")
                             turn_index += 1
-                            await gemini_ws.send(json.dumps({
-                                "clientContent": {
-                                    "turns": [{"role": "user", "parts": [{"text": msg["text"]}]}],
-                                    "turnComplete": True,
-                                }
+                            await oai_ws.send(json.dumps({
+                                "type": "conversation.item.create",
+                                "item": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": msg["text"]}],
+                                },
                             }))
+                            await oai_ws.send(json.dumps({"type": "response.create"}))
 
                 except WebSocketDisconnect:
                     print("[WS] Client disconnected")
                 except Exception as e:
-                    print(f"[WS] client_to_gemini error: {e}")
+                    print(f"[WS] client_to_openai error: {e}")
                 finally:
-                    # Close Gemini WS so gemini_to_client() unblocks and exits
-                    print("[WS] Closing Gemini connection to unblock relay task")
+                    print("[WS] Closing OpenAI connection to unblock relay task")
                     try:
-                        await gemini_ws.close()
+                        await oai_ws.close()
                     except Exception:
                         pass
 
             # Run both relay tasks concurrently
             await asyncio.gather(
-                gemini_to_client(),
-                client_to_gemini(),
+                openai_to_client(),
+                client_to_openai(),
                 return_exceptions=True,
             )
 
@@ -1077,75 +1795,118 @@ async def websocket_interview(ws: WebSocket, token: str):
         transcript_parts.append({"role": "ai", "text": model_text_buffer.strip(), "index": turn_index})
         model_text_buffer = ""
 
-    # Post-interview: transcribe candidate audio and fill in transcript placeholders
+    # Post-interview scoring: memory-first, STT fallback
     print(f"[POST] Starting post-interview processing for candidate_id={candidate_id}")
-    print(f"[POST] Audio segments to transcribe: {len(all_candidate_audio)}, AI transcript parts: {len([p for p in transcript_parts if p['role'] == 'ai'])}")
+    print(
+        f"[POST] Live memory events captured: {len(live_memory_events)}, "
+        f"audio segments captured: {len(all_candidate_audio)}"
+    )
+
+    enable_live_memory_scoring = _env_flag("ENABLE_LIVE_MEMORY_SCORING", True)
+    enable_stt_fallback = True  # Always attempt STT fallback for scoring
     try:
-        for i, audio_entry in enumerate(all_candidate_audio):
-            try:
-                print(f"[POST] Transcribing audio segment {i+1}/{len(all_candidate_audio)} (index={audio_entry['index']}, chunks={len(audio_entry['chunks'])})")
-                stt_text = await transcribe_audio_with_stt_v2(audio_entry["chunks"])
-                print(f"[POST] STT result for segment {i+1}: '{stt_text[:80]}...' " if len(stt_text) > 80 else f"[POST] STT result for segment {i+1}: '{stt_text}'")
-                if stt_text:
-                    for part in transcript_parts:
-                        if part.get("index") == audio_entry["index"] and part["role"] == "user":
-                            part["text"] = stt_text
-                            break
-            except Exception as e:
-                import traceback
-                print(f"[POST] STT error for segment {i+1}: {e}")
-                traceback.print_exc()
+        min_live_memory_events = int(os.getenv("LIVE_MEMORY_MIN_EVENTS", "3"))
+    except ValueError:
+        min_live_memory_events = 3
 
-        # Sort by index and build transcript string
-        transcript_parts.sort(key=lambda p: p.get("index", 0))
-        filled_parts = [p for p in transcript_parts if p.get("text")]
-        print(f"[POST] Transcript parts after STT: {len(filled_parts)} non-empty (of {len(transcript_parts)} total)")
-        transcript_text = "\n\n".join(
-            f"{'Interviewer' if p['role'] == 'ai' else 'Candidate'}: {p['text']}"
-            for p in filled_parts
-        )
-        print(f"[POST] Final transcript length: {len(transcript_text)} chars")
-
-        # Score even if transcript is empty (candidate connected but STT failed)
-        # Use a fallback placeholder so the candidate still appears in the dashboard
-        if not transcript_text.strip():
-            if all_candidate_audio or any(p["role"] == "ai" for p in transcript_parts):
-                print("[POST] WARNING: transcript is empty but interview happened -using fallback transcript")
-                transcript_text = "Interviewer: [Interview audio captured but transcription unavailable]"
-            else:
-                print("[POST] No interview data at all -skipping scoring")
-
-        if transcript_text.strip():
-            print(f"[POST] Starting scoring for candidate_id={candidate_id}")
-            async for db in get_db():
-                candidate_result = await db.execute(
-                    select(Candidate).where(Candidate.id == candidate_id)
-                )
-                candidate_db = candidate_result.scalar_one_or_none()
-                if not candidate_db:
-                    print(f"[POST] ERROR: candidate_id={candidate_id} not found in DB")
-                    break
-
-                existing_interview = await get_interview_result_for_candidate(db, candidate_id)
-                if candidate_db.status == "interview_completed" and existing_interview:
-                    print(f"[POST] Already scored -skipping")
-                    break
-
-                job_result = await db.execute(
-                    select(JobConfig).where(JobConfig.id == candidate_db.job_config_id)
-                )
-                job_db = job_result.scalar_one_or_none()
-                if not job_db:
-                    print(f"[POST] ERROR: job_config not found for candidate_id={candidate_id}")
-                    break
-
-                scoring = await score_interview(transcript_text, job_db, candidate_db)
-                print(f"[POST] Scoring done: global_score={scoring.get('global_score')}, recommendation={scoring.get('recommendation')}")
-                await upsert_interview_result(db, candidate_db.id, transcript_text, scoring)
-                apply_scoring_to_candidate(candidate_db, scoring)
-                await db.commit()
-                print(f"[POST] DB commit done -candidate_id={candidate_id} marked as interview_completed")
+    try:
+        async for db in get_db():
+            candidate_result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
+            candidate_db = candidate_result.scalar_one_or_none()
+            if not candidate_db:
+                print(f"[POST] ERROR: candidate_id={candidate_id} not found in DB")
                 break
+
+            existing_interview = await get_interview_result_for_candidate(db, candidate_id)
+            if candidate_db.status == "interview_completed" and existing_interview:
+                print("[POST] Already scored -skipping")
+                break
+
+            job_result = await db.execute(select(JobConfig).where(JobConfig.id == candidate_db.job_config_id))
+            job_db = job_result.scalar_one_or_none()
+            if not job_db:
+                print(f"[POST] ERROR: job_config not found for candidate_id={candidate_id}")
+                break
+
+            scoring = None
+            transcript_text = ""
+            scoring_source = ""
+            fallback_reason = None
+
+            if enable_live_memory_scoring:
+                is_valid, live_reason = validate_live_memory_events(
+                    live_memory_events, job_db.mandatory_questions or [], min_live_memory_events
+                )
+                if is_valid:
+                    print("[POST] Using live memory scoring as primary path")
+                    scoring = score_interview_from_live_memory(live_memory_events, job_db, candidate_db)
+                    transcript_text = build_structured_transcript_from_live_memory(
+                        transcript_parts, live_memory_events
+                    )
+                    scoring_source = "live_memory"
+                else:
+                    fallback_reason = live_reason
+                    print(f"[POST] Live memory scoring unavailable: {live_reason}")
+            else:
+                fallback_reason = "live_memory_scoring_disabled"
+                print("[POST] Live memory scoring disabled by config")
+
+            if scoring is None and enable_stt_fallback:
+                print("[POST] Running STT fallback pipeline")
+                transcript_text = await build_transcript_from_stt_segments(
+                    all_candidate_audio, transcript_parts
+                )
+                if not transcript_text.strip():
+                    if all_candidate_audio or any(p["role"] == "ai" for p in transcript_parts):
+                        transcript_text = "Interviewer: [Interview audio captured but transcription unavailable]"
+                    fallback_reason = fallback_reason or "stt_transcript_unavailable"
+
+                if transcript_text.strip():
+                    scoring = await score_interview(transcript_text, job_db, candidate_db)
+                    scoring_source = "stt_fallback"
+                else:
+                    fallback_reason = fallback_reason or "no_interview_data"
+
+            if scoring is None:
+                print("[POST] Falling back to neutral score due to missing data")
+                scoring = {
+                    "summary": "Scoring failed due to missing structured memory and transcript data.",
+                    "questions": [],
+                    "keyword_coverage": [],
+                    "strengths": [],
+                    "weaknesses": [],
+                    "experience_score": 5,
+                    "technical_score": 5,
+                    "communication_score": 5,
+                    "global_score": 50,
+                    "recommendation": "maybe",
+                    "red_flags": [
+                        f"Automated scoring fallback: {fallback_reason or 'unknown_reason'}"
+                    ],
+                    "theme_scores": {},
+                    "tech_stack_match": None,
+                }
+                scoring_source = "fallback_default"
+                transcript_text = (
+                    transcript_text.strip()
+                    or "Interviewer: [Interview data captured but automated scoring unavailable]"
+                )
+
+            scoring["scoring_source"] = scoring_source
+            scoring["live_memory_events"] = live_memory_events
+            if fallback_reason and scoring_source != "live_memory":
+                scoring["fallback_reason"] = fallback_reason
+
+            print(
+                f"[POST] Scoring done via {scoring_source}: "
+                f"global_score={scoring.get('global_score')}, recommendation={scoring.get('recommendation')}"
+            )
+
+            await upsert_interview_result(db, candidate_db.id, transcript_text, scoring)
+            apply_scoring_to_candidate(candidate_db, scoring)
+            await db.commit()
+            print(f"[POST] DB commit done -candidate_id={candidate_id} marked as interview_completed")
+            break
 
     except Exception as e:
         import traceback

@@ -106,11 +106,22 @@ async def init_db():
                     "database", "testing", "devops"
                 ],
                 mandatory_questions=[
-                    {"question": "Tell me about yourself and your background in software development.", "expected_themes": []},
-                    {"question": "Describe a challenging project you worked on recently. What was your role and what technologies did you use?", "expected_themes": []},
-                    {"question": "How do you approach debugging a complex issue in production?", "expected_themes": []},
-                    {"question": "Tell me about your experience with team collaboration and agile workflows.", "expected_themes": []},
-                    {"question": "Where do you see yourself in the next two years, and what are you looking to learn?", "expected_themes": []},
+                    {
+                        "question": "Walk me through a full-stack feature you built end-to-end — from database schema to UI. What technical choices did you make and why?",
+                        "expected_themes": ["data modeling / schema design", "API design (REST or GraphQL)", "frontend state management", "trade-offs explained"],
+                    },
+                    {
+                        "question": "Tell me about a time you had to debug a critical issue in production. How did you approach it?",
+                        "expected_themes": ["observability tools (logs, metrics, traces)", "systematic isolation of root cause", "impact mitigation while investigating", "post-mortem or preventive measures"],
+                    },
+                    {
+                        "question": "How do you approach code quality and testing in a team environment?",
+                        "expected_themes": ["types of tests written (unit, integration, e2e)", "code review process", "CI/CD integration", "handling legacy or untested code"],
+                    },
+                    {
+                        "question": "Describe a project where you had to learn a new technology or framework under time pressure. How did you handle it?",
+                        "expected_themes": ["learning strategy (docs, sandbox, community)", "managing delivery risk", "what they retained long-term", "communication with team about uncertainty"],
+                    },
                 ],
                 match_threshold=0.01,
                 max_interview_minutes=8,

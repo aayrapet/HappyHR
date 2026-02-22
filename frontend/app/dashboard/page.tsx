@@ -20,11 +20,19 @@ interface CandidateListItem {
 }
 
 interface QuestionResult {
+  sequence?: number;
   question_id: string;
+  question_type?: string;
   question_text: string;
   answer_summary: string;
   score: number;
   evidence: string[];
+  experience_signal?: number;
+  technical_signal?: number;
+  communication_signal?: number;
+  confidence?: number;
+  expected_themes_covered?: string[];
+  expected_themes_missing?: string[];
 }
 
 interface KeywordCoverage {
@@ -43,6 +51,13 @@ interface CandidateDetail extends CandidateListItem {
     global_score: number;
     recommendation: string;
     red_flags: string[];
+    question_assessments?: QuestionResult[];
+    experience_score?: number;
+    technical_score?: number;
+    communication_score?: number;
+    scoring_source?: string | null;
+    fallback_reason?: string | null;
+    live_memory_event_count?: number | null;
   } | null;
 }
 
@@ -452,6 +467,11 @@ export default function DashboardPage() {
     return "text-red-600";
   };
 
+  const detailedAssessments: QuestionResult[] =
+    selected?.interview?.question_assessments && selected.interview.question_assessments.length > 0
+      ? selected.interview.question_assessments
+      : selected?.interview?.questions || [];
+
   // ── Render ────────────────────────────────────────────
 
   return (
@@ -565,7 +585,7 @@ export default function DashboardPage() {
                 {selected.interview ? (
                   <>
                     {/* Score Overview */}
-                    <div className="grid grid-cols-3 gap-4 mb-6">
+                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
                       <div className="bg-white rounded-xl p-4 border border-slate-200">
                         <p className="text-sm text-slate-500">Global Score</p>
                         <p className={`text-3xl font-bold ${scoreColor(selected.interview.global_score)}`}>
@@ -577,10 +597,46 @@ export default function DashboardPage() {
                         <p className="text-lg font-semibold text-slate-900 capitalize">
                           {selected.interview.recommendation?.replace("_", " ")}
                         </p>
+                        {selected.interview.scoring_source && (
+                          <p className="text-xs text-slate-500 mt-1">
+                            Scoring source: {selected.interview.scoring_source.replace(/_/g, " ")}
+                          </p>
+                        )}
+                        {selected.interview.live_memory_event_count !== null && selected.interview.live_memory_event_count !== undefined && (
+                          <p className="text-xs text-slate-500 mt-1">
+                            Assessed exchanges: {selected.interview.live_memory_event_count}
+                          </p>
+                        )}
+                        {selected.interview.fallback_reason && (
+                          <p className="text-xs text-amber-600 mt-1">
+                            Fallback reason: {selected.interview.fallback_reason.replace(/_/g, " ")}
+                          </p>
+                        )}
                       </div>
                       <div className="bg-white rounded-xl p-4 border border-slate-200">
                         <p className="text-sm text-slate-500">CV Match</p>
                         <p className="text-3xl font-bold text-blue-600">{selected.match_percent}%</p>
+                      </div>
+                      <div className="bg-white rounded-xl p-4 border border-slate-200">
+                        <p className="text-sm text-slate-500">Experience</p>
+                        <p className="text-3xl font-bold text-slate-900">
+                          {selected.interview.experience_score !== undefined ? selected.interview.experience_score : "-"}
+                          <span className="text-base text-slate-500">/10</span>
+                        </p>
+                      </div>
+                      <div className="bg-white rounded-xl p-4 border border-slate-200">
+                        <p className="text-sm text-slate-500">Technical</p>
+                        <p className="text-3xl font-bold text-slate-900">
+                          {selected.interview.technical_score !== undefined ? selected.interview.technical_score : "-"}
+                          <span className="text-base text-slate-500">/10</span>
+                        </p>
+                      </div>
+                      <div className="bg-white rounded-xl p-4 border border-slate-200">
+                        <p className="text-sm text-slate-500">Communication</p>
+                        <p className="text-3xl font-bold text-slate-900">
+                          {selected.interview.communication_score !== undefined ? selected.interview.communication_score : "-"}
+                          <span className="text-base text-slate-500">/10</span>
+                        </p>
                       </div>
                     </div>
 
@@ -604,19 +660,45 @@ export default function DashboardPage() {
 
                     {/* Questions */}
                     <div className="bg-white rounded-xl p-4 border border-slate-200 mb-6">
-                      <h3 className="font-semibold text-slate-900 mb-3">Question Scores</h3>
+                      <h3 className="font-semibold text-slate-900 mb-3">Question Assessments</h3>
                       <div className="space-y-4">
-                        {selected.interview.questions?.map((q, i) => (
+                        {detailedAssessments.map((q, i) => (
                           <div key={i} className="border-b border-slate-100 pb-3 last:border-0 last:pb-0">
                             <div className="flex items-start justify-between">
-                              <p className="font-medium text-slate-800 text-sm flex-1">{q.question_text}</p>
+                              <div className="flex-1">
+                                <p className="font-medium text-slate-800 text-sm">
+                                  {q.question_text || "[Question text unavailable]"}
+                                </p>
+                                <p className="text-xs text-slate-500 mt-1">
+                                  {q.question_id}
+                                  {q.question_type ? ` • ${q.question_type.replace(/_/g, " ")}` : ""}
+                                  {q.sequence ? ` • exchange #${q.sequence}` : ""}
+                                </p>
+                              </div>
                               <span className={`ml-2 text-lg font-bold ${q.score >= 4 ? "text-green-600" : q.score >= 3 ? "text-yellow-600" : "text-red-600"}`}>
                                 {q.score}/5
                               </span>
                             </div>
                             <p className="text-sm text-slate-600 mt-1">{q.answer_summary}</p>
+                            <div className="mt-2 grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                              <span className="px-2 py-1 rounded bg-slate-100 text-slate-700">
+                                Exp: {q.experience_signal !== undefined ? q.experience_signal : "-"}
+                              </span>
+                              <span className="px-2 py-1 rounded bg-slate-100 text-slate-700">
+                                Tech: {q.technical_signal !== undefined ? q.technical_signal : "-"}
+                              </span>
+                              <span className="px-2 py-1 rounded bg-slate-100 text-slate-700">
+                                Comms: {q.communication_signal !== undefined ? q.communication_signal : "-"}
+                              </span>
+                              <span className="px-2 py-1 rounded bg-slate-100 text-slate-700">
+                                Confidence: {q.confidence !== undefined ? q.confidence : "-"}
+                              </span>
+                            </div>
                           </div>
                         ))}
+                        {detailedAssessments.length === 0 && (
+                          <p className="text-sm text-slate-500">No detailed assessments available.</p>
+                        )}
                       </div>
                     </div>
 
