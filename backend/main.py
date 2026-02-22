@@ -351,7 +351,17 @@ IMPORTANT: Return ONLY valid JSON, no markdown, no extra text."""
                 text = text[:-3]
             elif "```" in text:
                 text = text[:text.rfind("```")]
-        scoring = json.loads(text.strip())
+        text = text.strip()
+        # Try to extract the first complete JSON object if extra text surrounds it
+        try:
+            scoring = json.loads(text)
+        except json.JSONDecodeError:
+            import re
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                scoring = json.loads(match.group())
+            else:
+                raise
 
         # Override recommendation based on global_score thresholds
         gs = scoring.get("global_score", 50)
@@ -1012,12 +1022,16 @@ async def websocket_interview(ws: WebSocket, token: str):
                             candidate_audio_chunks = []
 
                         elif msg.get("type") == "speechEnd":
-                            if candidate_audio_chunks:
+                            # Require at least 6 chunks (~2s) to avoid transcribing noise bursts
+                            MIN_SPEECH_CHUNKS = 6
+                            if len(candidate_audio_chunks) >= MIN_SPEECH_CHUNKS:
                                 idx = turn_index
                                 turn_index += 1
                                 all_candidate_audio.append({"index": idx, "chunks": list(candidate_audio_chunks)})
                                 # Add placeholder in transcript
                                 transcript_parts.append({"role": "user", "text": "", "index": idx})
+                            else:
+                                print(f"[WS] Discarded short segment ({len(candidate_audio_chunks)} chunks < {MIN_SPEECH_CHUNKS})")
                             candidate_audio_chunks = []
 
                         elif msg.get("type") == "text" and msg.get("text"):

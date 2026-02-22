@@ -1,36 +1,15 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useCallback, Component, type ReactNode, type ErrorInfo } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams } from "next/navigation";
-import dynamic from "next/dynamic";
-import type { AvatarHandle } from "./Avatar";
-
-const Avatar = dynamic(() => import("./Avatar"), { ssr: false });
-
-class AvatarErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean }> {
-  constructor(props: { children: ReactNode }) {
-    super(props);
-    this.state = { hasError: false };
-  }
-  static getDerivedStateFromError() {
-    return { hasError: true };
-  }
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error("Avatar crashed:", error, info);
-  }
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div className="w-full h-full flex items-center justify-center bg-slate-100">
-          <p className="text-slate-500 text-sm">Avatar failed to load. The interview can still proceed with audio only.</p>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+interface TranscriptEntry {
+  role: "user" | "ai";
+  text: string;
+  timestamp: number;
+}
 
 interface InterviewContext {
   candidate_name: string;
@@ -42,7 +21,24 @@ interface InterviewContext {
   max_interview_minutes: number;
 }
 
-// ── Audio helpers (microphone capture only) ──────────────────────
+// ── Audio helpers (from vocal-part) ──────────────────────
+
+function int16ToFloat32(int16: Int16Array): Float32Array {
+  const f32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) {
+    f32[i] = int16[i] / 32768;
+  }
+  return f32;
+}
+
+function base64ToInt16(base64: string): Int16Array {
+  const binary = atob(base64);
+  const len = binary.length;
+  const buffer = new ArrayBuffer(len);
+  const bytes = new Uint8Array(buffer);
+  for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+  return new Int16Array(buffer);
+}
 
 function floatTo16BitPCM(float32Array: Float32Array): Uint8Array {
   const buffer = new ArrayBuffer(float32Array.length * 2);
@@ -96,21 +92,33 @@ export default function InterviewPage() {
 
   const [phase, setPhase] = useState<"loading" | "ready" | "live" | "ending" | "done" | "error">("loading");
   const [context, setContext] = useState<InterviewContext | null>(null);
+  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [error, setError] = useState("");
   const [elapsed, setElapsed] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const avatarRef = useRef<AvatarHandle>(null);
-  const micAudioCtxRef = useRef<AudioContext | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const playbackTimeRef = useRef(0);
+  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const transcriptEndRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const startTimeRef = useRef<number>(0);
   const speakingRef = useRef(false);
-  const speakingCountRef = useRef(0);
-  const silenceCountRef = useRef(0);
+  const transcriptRef = useRef<TranscriptEntry[]>([]);
+
+  // Keep transcriptRef in sync
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
+
+  // Scroll transcript to bottom
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [transcript]);
 
   // Load interview context
   useEffect(() => {
@@ -131,11 +139,43 @@ export default function InterviewPage() {
     })();
   }, [token]);
 
-  // ── Playback controls ──
-  // Audio playback is now handled by the Avatar component.
-  // stopPlaybackNow tells the avatar to stop its audio.
+  // ── Playback controls (from vocal-part) ──
+
   const stopPlaybackNow = useCallback(() => {
-    avatarRef.current?.stopAudio();
+    for (const src of activeSourcesRef.current) {
+      try { src.stop(0); } catch { /* ignore */ }
+    }
+    activeSourcesRef.current.clear();
+    if (audioCtxRef.current) {
+      playbackTimeRef.current = audioCtxRef.current.currentTime;
+    }
+  }, []);
+
+  const playPcmBase64 = useCallback((base64: string, mimeType: string = "audio/pcm;rate=24000") => {
+    const audioCtx = audioCtxRef.current;
+    if (!audioCtx) return;
+
+    const sampleRateMatch = /rate=(\d+)/.exec(mimeType);
+    const sampleRate = sampleRateMatch ? Number(sampleRateMatch[1]) : 24000;
+
+    const pcm16 = base64ToInt16(base64);
+    const audioData = int16ToFloat32(pcm16);
+
+    const buffer = audioCtx.createBuffer(1, audioData.length, sampleRate);
+    buffer.copyToChannel(new Float32Array(audioData.buffer as ArrayBuffer), 0);
+
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioCtx.destination);
+
+    if (playbackTimeRef.current < audioCtx.currentTime) {
+      playbackTimeRef.current = audioCtx.currentTime;
+    }
+    source.start(playbackTimeRef.current);
+    playbackTimeRef.current += buffer.duration;
+
+    activeSourcesRef.current.add(source);
+    source.onended = () => activeSourcesRef.current.delete(source);
   }, []);
 
   // ── Start interview ──
@@ -149,22 +189,6 @@ export default function InterviewPage() {
     }, 1000);
 
     try {
-      // Wait for TalkingHead to finish loading (it starts loading in the "ready" phase)
-      await new Promise<void>((resolve) => {
-        const deadline = Date.now() + 15000;
-        const check = () => {
-          if (avatarRef.current?.isReady() || Date.now() > deadline) {
-            resolve();
-          } else {
-            setTimeout(check, 100);
-          }
-        };
-        check();
-      });
-
-      // Initialize avatar streaming
-      await avatarRef.current?.startStream();
-
       // Build WebSocket URL to backend
       const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const apiHost = new URL(API).host;
@@ -191,17 +215,25 @@ export default function InterviewPage() {
         }
 
         if (msg.type === "text") {
-          // Text received (not displayed, but still processed by backend for scoring)
+          // AI transcript text
+          setTranscript(prev => {
+            const last = prev[prev.length - 1];
+            if (last && last.role === "ai") {
+              return [...prev.slice(0, -1), { ...last, text: last.text + " " + msg.text }];
+            }
+            return [...prev, { role: "ai", text: msg.text, timestamp: Date.now() }];
+          });
           return;
         }
 
         if (msg.type === "audio") {
-          // Route audio to Avatar for playback + lip sync
-          avatarRef.current?.feedAudio(msg.data, msg.mimeType);
+          playPcmBase64(msg.data, msg.mimeType);
           return;
         }
 
         if (msg.type === "turnComplete") {
+          // Force new transcript entry for next speaker
+          setTranscript(prev => [...prev]);
           return;
         }
 
@@ -218,9 +250,10 @@ export default function InterviewPage() {
         console.error("WebSocket error");
       };
 
-      // Set up a separate AudioContext for microphone capture only
-      const micAudioCtx = new (window.AudioContext || (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-      micAudioCtxRef.current = micAudioCtx;
+      // Set up audio context
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioCtxRef.current = audioCtx;
+      playbackTimeRef.current = audioCtx.currentTime;
 
       // Get microphone
       const micStream = await navigator.mediaDevices.getUserMedia({
@@ -232,10 +265,10 @@ export default function InterviewPage() {
       });
       micStreamRef.current = micStream;
 
-      // Set up ScriptProcessor with speech detection
-      const micSource = micAudioCtx.createMediaStreamSource(micStream);
+      // Set up ScriptProcessor with speech detection (from vocal-part)
+      const micSource = audioCtx.createMediaStreamSource(micStream);
       micSourceRef.current = micSource;
-      const processor = micAudioCtx.createScriptProcessor(4096, 1, 1);
+      const processor = audioCtx.createScriptProcessor(16384, 1, 1);
       processorRef.current = processor;
 
       processor.onaudioprocess = (event: AudioProcessingEvent) => {
@@ -243,33 +276,25 @@ export default function InterviewPage() {
 
         const input = event.inputBuffer.getChannelData(0);
 
-        // RMS-based speech detection with debounce
+        // RMS-based speech detection
         let rms = 0;
         for (let i = 0; i < input.length; i++) rms += input[i] * input[i];
         rms = Math.sqrt(rms / input.length);
 
-        const loud = rms > 0.05;
-        if (loud) {
-          silenceCountRef.current = 0;
-          speakingCountRef.current++;
-        } else {
-          speakingCountRef.current = 0;
-          silenceCountRef.current++;
-        }
-
-        if (!speakingRef.current && speakingCountRef.current >= 3) {
+        const speaking = rms > 0.045;
+        if (speaking && !speakingRef.current) {
           speakingRef.current = true;
           setIsSpeaking(true);
           stopPlaybackNow(); // Interrupt AI audio when user speaks
           wsRef.current.send(JSON.stringify({ type: "speechStart" }));
-        } else if (speakingRef.current && silenceCountRef.current >= 5) {
+        } else if (!speaking && speakingRef.current) {
           speakingRef.current = false;
           setIsSpeaking(false);
           wsRef.current.send(JSON.stringify({ type: "speechEnd" }));
         }
 
         // Downsample and send audio
-        const downsampled = downsampleTo16k(input, micAudioCtx.sampleRate);
+        const downsampled = downsampleTo16k(input, audioCtx.sampleRate);
         const pcmBytes = floatTo16BitPCM(downsampled);
         const b64 = bytesToBase64(pcmBytes);
 
@@ -281,7 +306,7 @@ export default function InterviewPage() {
       };
 
       micSource.connect(processor);
-      processor.connect(micAudioCtx.destination);
+      processor.connect(audioCtx.destination);
 
     } catch (err: unknown) {
       console.error("Start interview error:", err);
@@ -296,10 +321,10 @@ export default function InterviewPage() {
     setPhase("ending");
     if (timerRef.current) clearInterval(timerRef.current);
 
-    // Stop avatar playback
+    // Stop playback
     stopPlaybackNow();
 
-    // Stop microphone audio processing
+    // Stop audio processing
     if (processorRef.current) {
       processorRef.current.disconnect();
       processorRef.current.onaudioprocess = null;
@@ -313,9 +338,9 @@ export default function InterviewPage() {
       micStreamRef.current.getTracks().forEach(t => t.stop());
       micStreamRef.current = null;
     }
-    if (micAudioCtxRef.current) {
-      try { micAudioCtxRef.current.close(); } catch { /* ignore */ }
-      micAudioCtxRef.current = null;
+    if (audioCtxRef.current) {
+      try { audioCtxRef.current.close(); } catch { /* ignore */ }
+      audioCtxRef.current = null;
     }
 
     // Close WebSocket (this triggers server-side scoring)
@@ -368,68 +393,86 @@ export default function InterviewPage() {
     );
   }
 
-  // "ready", "live", "ending" — Avatar is always mounted so TalkingHead loads in background
-  return (
-    <div className="flex flex-col h-[calc(100vh-57px)]">
-      {/* Top bar — only visible during live/ending */}
-      {(phase === "live" || phase === "ending") && (
-        <div className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className={`w-3 h-3 rounded-full ${isSpeaking ? "bg-green-500 animate-pulse" : "bg-red-500 animate-pulse"}`} />
-            <span className="font-semibold text-slate-900">
-              {isSpeaking ? "You are speaking..." : "Interview in Progress"}
-            </span>
-            <span className="text-slate-500 text-sm">{formatTime(elapsed)}</span>
+  if (phase === "ready") {
+    return (
+      <div className="flex items-center justify-center min-h-[calc(100vh-57px)] px-4">
+        <div className="max-w-lg text-center">
+          <h1 className="text-3xl font-bold text-slate-900 mb-2">Voice Interview</h1>
+          <p className="text-slate-600 mb-1">Position: <strong>{context?.job_title}</strong></p>
+          <p className="text-slate-600 mb-6">Welcome, <strong>{context?.candidate_name}</strong></p>
+
+          <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 mb-6 text-left text-sm text-blue-800">
+            <p className="font-semibold mb-2">Before you begin:</p>
+            <ul className="list-disc list-inside space-y-1">
+              <li>Find a quiet environment</li>
+              <li>Allow microphone access when prompted</li>
+              <li>Speak naturally - the AI will detect when you start and stop talking</li>
+              <li>You can interrupt the interviewer by speaking</li>
+              <li>The interview takes about {context?.max_interview_minutes} minutes</li>
+            </ul>
           </div>
+
           <button
-            onClick={endInterview}
-            disabled={phase === "ending"}
-            className="bg-red-600 text-white px-4 py-2 rounded-lg font-medium hover:bg-red-700 disabled:opacity-50 text-sm"
+            onClick={startInterview}
+            className="bg-blue-600 text-white px-10 py-4 rounded-xl font-bold text-lg hover:bg-blue-700 transition-colors"
           >
-            {phase === "ending" ? "Ending..." : "End Interview"}
+            Start Interview
           </button>
         </div>
-      )}
+      </div>
+    );
+  }
 
-      {/* Avatar — always rendered so TalkingHead is ready before interview starts */}
-      <div className="flex-1 bg-gradient-to-b from-slate-50 to-slate-100 relative">
-        <AvatarErrorBoundary>
-          <Avatar ref={avatarRef} className="w-full h-full" />
-        </AvatarErrorBoundary>
-        {(phase === "live" || phase === "ending") && (
-          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-white/80 backdrop-blur-sm rounded-full px-4 py-1 text-sm font-medium text-slate-700">
-            Sarah (AI Interviewer)
-          </div>
-        )}
+  // Live phase
+  return (
+    <div className="flex flex-col h-[calc(100vh-57px)]">
+      {/* Top bar */}
+      <div className="bg-white border-b border-slate-200 px-6 py-3 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className={`w-3 h-3 rounded-full ${isSpeaking ? "bg-green-500 animate-pulse" : "bg-red-500 animate-pulse"}`} />
+          <span className="font-semibold text-slate-900">
+            {isSpeaking ? "You are speaking..." : "Interview in Progress"}
+          </span>
+          <span className="text-slate-500 text-sm">{formatTime(elapsed)}</span>
+        </div>
+        <button
+          onClick={endInterview}
+          disabled={phase === "ending"}
+          className="bg-red-600 text-white px-4 py-2 rounded-lg font-medium hover:bg-red-700 disabled:opacity-50 text-sm"
+        >
+          {phase === "ending" ? "Ending..." : "End Interview"}
+        </button>
+      </div>
 
-        {/* Ready overlay — shown before interview starts */}
-        {phase === "ready" && (
-          <div className="absolute inset-0 flex items-center justify-center bg-white/90 backdrop-blur-sm px-4">
-            <div className="max-w-lg text-center">
-              <h1 className="text-3xl font-bold text-slate-900 mb-2">Voice Interview</h1>
-              <p className="text-slate-600 mb-1">Position: <strong>{context?.job_title}</strong></p>
-              <p className="text-slate-600 mb-6">Welcome, <strong>{context?.candidate_name}</strong></p>
-
-              <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 mb-6 text-left text-sm text-blue-800">
-                <p className="font-semibold mb-2">Before you begin:</p>
-                <ul className="list-disc list-inside space-y-1">
-                  <li>Find a quiet environment</li>
-                  <li>Allow microphone access when prompted</li>
-                  <li>Speak naturally - the AI will detect when you start and stop talking</li>
-                  <li>You can interrupt the interviewer by speaking</li>
-                  <li>The interview takes about {context?.max_interview_minutes} minutes</li>
-                </ul>
-              </div>
-
-              <button
-                onClick={startInterview}
-                className="bg-blue-600 text-white px-10 py-4 rounded-xl font-bold text-lg hover:bg-blue-700 transition-colors"
+      {/* Transcript */}
+      <div className="flex-1 overflow-y-auto p-6">
+        <div className="max-w-2xl mx-auto space-y-4">
+          {transcript.length === 0 && (
+            <p className="text-center text-slate-400 mt-8">
+              The AI interviewer will start speaking shortly...
+            </p>
+          )}
+          {transcript.map((entry, i) => (
+            <div
+              key={i}
+              className={`flex ${entry.role === "user" ? "justify-end" : "justify-start"}`}
+            >
+              <div
+                className={`max-w-[80%] rounded-2xl px-4 py-3 ${
+                  entry.role === "user"
+                    ? "bg-blue-600 text-white"
+                    : "bg-white border border-slate-200 text-slate-800"
+                }`}
               >
-                Start Interview
-              </button>
+                <p className="text-xs font-medium mb-1 opacity-70">
+                  {entry.role === "user" ? "You" : "Sarah (AI)"}
+                </p>
+                <p className="text-sm">{entry.text}</p>
+              </div>
             </div>
-          </div>
-        )}
+          ))}
+          <div ref={transcriptEndRef} />
+        </div>
       </div>
     </div>
   );

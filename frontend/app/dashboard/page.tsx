@@ -53,12 +53,17 @@ interface QuestionItem {
   expected_themes: string[];
 }
 
+interface QuestionDraft {
+  question: string;
+  expectedThemesInput: string;
+}
+
 interface JobConfigItem {
   id: number;
   title: string;
   description: string;
   keywords: string[];
-  mandatory_questions: QuestionItem[];
+  mandatory_questions: Array<QuestionItem | string>;
   match_threshold: number;
   max_interview_minutes: number;
   is_active: boolean;
@@ -99,32 +104,40 @@ function ConfigForm({
   }) => void;
   onCancel: () => void;
 }) {
+  const normalizeQuestions = (rawQuestions: Array<QuestionItem | string> | undefined): QuestionDraft[] => {
+    if (!rawQuestions || rawQuestions.length === 0) {
+      return [{ question: "", expectedThemesInput: "" }];
+    }
+
+    return rawQuestions.map((raw) => {
+      if (typeof raw === "string") {
+        return { question: raw, expectedThemesInput: "" };
+      }
+      return {
+        question: raw.question ?? "",
+        expectedThemesInput: Array.isArray(raw.expected_themes) ? raw.expected_themes.join(", ") : "",
+      };
+    });
+  };
+
   const [title, setTitle] = useState(initial?.title || "");
   const [description, setDescription] = useState(initial?.description || "");
   const [keywordInput, setKeywordInput] = useState(initial?.keywords.join(", ") || "");
   const [threshold, setThreshold] = useState(initial ? initial.match_threshold * 100 : 30);
   const [maxMinutes, setMaxMinutes] = useState(initial?.max_interview_minutes || 8);
-  const [questions, setQuestions] = useState<QuestionItem[]>(
-    initial?.mandatory_questions.length
-      ? initial.mandatory_questions.map(q => ({ question: q.question, expected_themes: q.expected_themes ?? [] }))
-      : [{ question: "", expected_themes: [] }]
-  );
+  const [questions, setQuestions] = useState<QuestionDraft[]>(normalizeQuestions(initial?.mandatory_questions));
   const [saving, setSaving] = useState(false);
 
-  const addQuestion = () => setQuestions([...questions, { question: "", expected_themes: [] }]);
+  const addQuestion = () => setQuestions([...questions, { question: "", expectedThemesInput: "" }]);
 
   const removeQuestion = (idx: number) => {
     if (questions.length <= 1) return;
     setQuestions(questions.filter((_, i) => i !== idx));
   };
 
-  const updateQuestion = (idx: number, field: "question" | "expected_themes", value: string) => {
+  const updateQuestion = (idx: number, field: "question" | "expectedThemesInput", value: string) => {
     const updated = [...questions];
-    if (field === "expected_themes") {
-      updated[idx] = { ...updated[idx], expected_themes: value.split(",").map(s => s.trim()).filter(Boolean) };
-    } else {
-      updated[idx] = { ...updated[idx], [field]: value };
-    }
+    updated[idx] = { ...updated[idx], [field]: value };
     setQuestions(updated);
   };
 
@@ -136,7 +149,12 @@ function ConfigForm({
       title,
       description,
       keywords,
-      mandatory_questions: questions.filter(q => q.question.trim()),
+      mandatory_questions: questions
+        .filter(q => q.question.trim())
+        .map(q => ({
+          question: q.question.trim(),
+          expected_themes: q.expectedThemesInput.split(",").map(s => s.trim()).filter(Boolean),
+        })),
       match_threshold: threshold / 100,
       max_interview_minutes: maxMinutes,
     });
@@ -186,7 +204,7 @@ function ConfigForm({
         />
         {keywordInput && (
           <div className="flex flex-wrap gap-1 mt-2">
-            {keywordInput.split(",").map((k, i) => k.trim()).filter(Boolean).map((k, i) => (
+            {keywordInput.split(",").map((k) => k.trim()).filter(Boolean).map((k, i) => (
               <span key={i} className="px-2 py-0.5 bg-blue-100 text-blue-800 text-xs rounded-full">{k}</span>
             ))}
           </div>
@@ -250,8 +268,8 @@ function ConfigForm({
                   />
                   <input
                     type="text"
-                    value={(q.expected_themes ?? []).join(", ")}
-                    onChange={e => updateQuestion(i, "expected_themes", e.target.value)}
+                    value={q.expectedThemesInput}
+                    onChange={e => updateQuestion(i, "expectedThemesInput", e.target.value)}
                     placeholder="Expected themes (comma-separated, optional)..."
                     className="w-full border border-slate-200 rounded-lg px-3 py-1.5 text-xs text-slate-600 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                   />
