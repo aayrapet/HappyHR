@@ -43,6 +43,9 @@ npm install
 npm run dev
 ```
 
+Make sure to have valid Gemini and Open Ai keys valid in .env
+
+
 Open [http://localhost:3000](http://localhost:3000). Create a job, share the apply link, and run voice interviews.
 
 ---
