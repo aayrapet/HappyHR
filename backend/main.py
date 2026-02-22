@@ -151,6 +151,37 @@ def keyword_match_lemmatized(cv_text: str, keywords: list[str]) -> float:
     return matched / len(prepared)
 
 
+async def build_screening_feedback(cv_text: str, job: JobConfig) -> str:
+    api_key = os.getenv("GEMINI_API_KEY")
+    scoring_model = os.getenv("SCORING_MODEL", "gemini-2.5-flash-lite")
+    fallback = (
+        "Thank you for your application. Your profile shows relevant strengths, "
+        "and we encourage you to apply again as your experience continues to grow."
+    )
+    if not api_key:
+        return fallback
+
+    prompt = f"""You are an HR assistant.
+Write a short and polite rejection feedback for CV screening in exactly 2 sentences.
+Tone: professional and encouraging. Do not mention internal hiring policy.
+
+Job title: {job.title}
+Required skills: {json.dumps(job.keywords[:12])}
+Candidate CV excerpt:
+{cv_text[:1800]}
+
+Return only plain text."""
+    try:
+        from google import genai
+
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(model=scoring_model, contents=prompt)
+        text = (response.text or "").strip()
+        return text or fallback
+    except Exception:
+        return fallback
+
+
 def cosine_sim_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-12)
     b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-12)
@@ -837,7 +868,8 @@ async def apply(
     if passed:
         send_interview_invite(email, first_name, token, job.title)
     else:
-        send_rejection_email(email, first_name, job.title)
+        screening_feedback = await build_screening_feedback(cv_text, job)
+        send_rejection_email(email, first_name, job.title, screening_feedback)
 
     return {
         "status": "invited" if passed else "rejected",
@@ -938,6 +970,7 @@ def apply_scoring_to_interview(
 ) -> None:
     interview_result.transcript = transcript
     interview_result.summary = scoring.get("summary")
+    interview_result.summary_candidate = scoring.get("summary_candidate")
     interview_result.questions = scoring.get("questions")
     interview_result.keyword_coverage = scoring.get("keyword_coverage")
     interview_result.global_score = scoring.get("global_score")
@@ -1043,6 +1076,7 @@ TRANSCRIPT:
 Produce a JSON response with EXACTLY this structure:
 {{
   "summary": "2-3 sentence overall summary of the candidate's performance",
+  "summary_candidate": "2-3 polite and concise sentences addressed to the candidate, with constructive feedback and no internal hiring rationale",
   "questions": [
     {{
       "question_id": "q1",
@@ -1119,6 +1153,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown, no extra text."""
         print(f"Scoring error: {e}")
         return {
             "summary": "Scoring failed due to an error.",
+            "summary_candidate": "Thank you for your interview. We appreciate your time and will get back to you soon.",
             "questions": [],
             "keyword_coverage": [],
             "strengths": [],
@@ -1183,6 +1218,7 @@ async def get_candidate(candidate_id: int, db: AsyncSession = Depends(get_db)):
         "interview": {
             "transcript": interview.transcript,
             "summary": interview.summary,
+            "summary_candidate": interview.summary_candidate,
             "questions": interview.questions,
             "question_assessments": (
                 interview.raw_scoring_json.get("question_assessments") or interview.questions
@@ -1222,6 +1258,7 @@ async def get_candidate(candidate_id: int, db: AsyncSession = Depends(get_db)):
 
 class DecisionRequest(BaseModel):
     decision: str  # "accept" or "reject"
+    summary_candidate: Optional[str] = None
 
 
 @app.post("/api/candidate/{candidate_id}/decision")
@@ -1240,12 +1277,27 @@ async def candidate_decision(
 
     job_result = await db.execute(select(JobConfig).where(JobConfig.id == c.job_config_id))
     job = job_result.scalar_one_or_none()
+    ir_result = await db.execute(
+        select(InterviewResult).where(InterviewResult.candidate_id == candidate_id)
+    )
+    interview = ir_result.scalar_one_or_none()
 
     new_status = "accepted" if body.decision == "accept" else "rejected_after_interview"
     c.status = new_status
     await db.commit()
 
-    send_decision_email(c.email, c.first_name, job.title if job else "the position", body.decision)
+    summary_for_email = (
+        body.summary_candidate
+        or (interview.summary_candidate if interview else None)
+        or (interview.summary if interview else None)
+    )
+    send_decision_email(
+        c.email,
+        c.first_name,
+        job.title if job else "the position",
+        body.decision,
+        summary_for_email,
+    )
 
     return {"status": new_status}
 

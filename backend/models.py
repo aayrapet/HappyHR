@@ -49,6 +49,7 @@ class InterviewResult(Base):
     candidate_id = Column(Integer, nullable=False, unique=True)
     transcript = Column(Text, nullable=False)
     summary = Column(Text, nullable=True)
+    summary_candidate = Column(Text, nullable=True)
     questions = Column(JSON, nullable=True)  # list of question objects
     keyword_coverage = Column(JSON, nullable=True)
     global_score = Column(Float, nullable=True)

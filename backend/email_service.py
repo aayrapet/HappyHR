@@ -52,11 +52,22 @@ def send_interview_invite(to_email: str, name: str, token: str, job_title: str):
     send_email(to_email, subject, body)
 
 
-def send_rejection_email(to_email: str, name: str, job_title: str):
+def send_rejection_email(
+    to_email: str,
+    name: str,
+    job_title: str,
+    screening_feedback: str | None = None,
+):
+    feedback_block = (
+        f"<p><strong>Screening feedback:</strong> {screening_feedback}</p>"
+        if screening_feedback
+        else ""
+    )
     subject = f"HappyHR - Application Update for {job_title}"
     body = f"""
     <h2>Hi {name},</h2>
     <p>Thank you for your interest in the <strong>{job_title}</strong> position.</p>
+    {feedback_block}
     <p>After reviewing your application, we've decided to move forward with other candidates whose experience more closely matches our current requirements.</p>
     <p>We encourage you to apply again in the future.</p>
     <p>Best regards,<br>The HappyHR Team</p>
@@ -64,7 +75,18 @@ def send_rejection_email(to_email: str, name: str, job_title: str):
     send_email(to_email, subject, body)
 
 
-def send_decision_email(to_email: str, name: str, job_title: str, decision: str):
+def send_decision_email(
+    to_email: str,
+    name: str,
+    job_title: str,
+    decision: str,
+    summary_candidate: str | None = None,
+):
+    feedback_block = (
+        f"<p><strong>Interview feedback:</strong> {summary_candidate}</p>"
+        if summary_candidate
+        else ""
+    )
     if decision == "accept":
         subject = f"HappyHR - Great News About Your {job_title} Application!"
         body = f"""
@@ -78,6 +100,7 @@ def send_decision_email(to_email: str, name: str, job_title: str, decision: str)
         body = f"""
         <h2>Hi {name},</h2>
         <p>Thank you for completing the interview for the <strong>{job_title}</strong> position.</p>
+        {feedback_block}
         <p>After careful consideration, we've decided to proceed with other candidates.</p>
         <p>We wish you the best in your job search.</p>
         <p>Best regards,<br>The HappyHR Team</p>
